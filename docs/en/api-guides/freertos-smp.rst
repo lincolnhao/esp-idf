@@ -16,6 +16,9 @@ of FreeRTOS v8.2.0. This guide outlines the major differences between vanilla
 FreeRTOS and ESP-IDF FreeRTOS. The API reference for vanilla FreeRTOS can be 
 found via http://www.freertos.org/a00106.html
 
+For information regarding features that are exclusive to ESP-IDF FreeRTOS,
+see :doc:`ESP-IDF FreeRTOS Additions<../api-reference/system/freertos_additions>`.
+
 :ref:`backported-features`: Although ESP-IDF FreeRTOS is based on the Xtensa 
 port of FreeRTOS v8.2.0, a number of FreeRTOS v9.0.0 features have been backported
 to ESP-IDF.
@@ -69,10 +72,6 @@ added. Deletion callbacks are called automatically during task deletion and are
 used to free memory pointed to by TLSP. Call 
 :cpp:func:`vTaskSetThreadLocalStoragePointerAndDelCallback()` to set TLSP and Deletion
 Callbacks.
-
-:ref:`FreeRTOS Hooks<hooks_api_reference>`: Vanilla FreeRTOS Hooks were not designed for SMP.
-ESP-IDF provides its own Idle and Tick Hooks in addition to the Vanilla FreeRTOS
-hooks. For full details, see the ESP-IDF Hooks API Reference.
 
 :ref:`esp-idf-freertos-configuration`: Several aspects of ESP-IDF FreeRTOS can be 
 configured using ``make meunconfig`` such as running ESP-IDF in Unicore Mode,
@@ -497,3 +496,11 @@ functionality of :cpp:func:`xTaskCreateStaticPinnedToCore` in ESP-IDF FreeRTOS
 particular functions in ESP-IDF FreeRTOS which have not been fully tested
 in an SMP context.
 
+:ref:`CONFIG_FREERTOS_TASK_FUNCTION_WRAPPER` will enclose all task functions 
+within a wrapper function. In the case that a task function mistakenly returns 
+(i.e. does not call :cpp:func:`vTaskDelete`), the call flow will return to the 
+wrapper function. The wrapper function will then log an error and abort the 
+application, as illustrated below::
+
+    E (25) FreeRTOS: FreeRTOS task should not return. Aborting now!
+    abort() was called at PC 0x40085c53 on core 0

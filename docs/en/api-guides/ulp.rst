@@ -15,8 +15,8 @@ Installing the toolchain
 
 ULP coprocessor code is written in assembly and compiled using the `binutils-esp32ulp toolchain`_.
 
-1. Download the toolchain using the links listed on this page:
-https://github.com/espressif/binutils-esp32ulp/wiki#downloads
+1. Download pre-built binaries of the latest toolchain release from:
+https://github.com/espressif/binutils-esp32ulp/releases.
 
 2. Extract the toolchain into a directory, and add the path to the ``bin/`` directory of the toolchain to the ``PATH`` environment variable.
 
@@ -134,7 +134,7 @@ Each ULP program is embedded into the ESP-IDF application as a binary blob. Appl
 
 Once the program is loaded into RTC memory, application can start it, passing the address of the entry point to ``ulp_run`` function::
 
-    ESP_ERROR_CHECK( ulp_run((&ulp_entry - RTC_SLOW_MEM) / sizeof(uint32_t)) );
+    ESP_ERROR_CHECK( ulp_run(&ulp_entry - RTC_SLOW_MEM) );
 
 .. doxygenfunction:: ulp_run
 
@@ -151,7 +151,7 @@ ULP program flow
 
 ULP coprocessor is started by a timer. The timer is started once ``ulp_run`` is called. The timer counts a number of RTC_SLOW_CLK ticks (by default, produced by an internal 150kHz RC oscillator). The number of ticks is set using ``SENS_ULP_CP_SLEEP_CYCx_REG`` registers (x = 0..4). When starting the ULP for the first time, ``SENS_ULP_CP_SLEEP_CYC0_REG`` will be used to set the number of timer ticks. Later the ULP program can select another ``SENS_ULP_CP_SLEEP_CYCx_REG`` register using ``sleep`` instruction.
 
-The application can set ULP timer period values (SENS_ULP_CP_SLEEP_CYCx_REG, x = 0..4) using ``ulp_wakeup_period_set`` function.
+The application can set ULP timer period values (SENS_ULP_CP_SLEEP_CYCx_REG, x = 0..4) using ``ulp_set_wakeup_period`` function.
 
 .. doxygenfunction:: ulp_set_wakeup_period
 

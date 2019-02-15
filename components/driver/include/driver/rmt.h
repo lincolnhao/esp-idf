@@ -80,6 +80,19 @@ typedef enum {
     RMT_CARRIER_LEVEL_MAX
 } rmt_carrier_level_t;
 
+typedef enum {
+    RMT_CHANNEL_UNINIT = 0, /*!< RMT channel uninitialized */
+    RMT_CHANNEL_IDLE = 1,   /*!< RMT channel status idle */
+    RMT_CHANNEL_BUSY = 2,   /*!< RMT channel status busy */
+} rmt_channel_status_t;
+
+/**
+ * @brief Data struct of RMT channel status
+ */
+typedef struct {
+  rmt_channel_status_t status[RMT_CHANNEL_MAX]; /*!< Store the current status of each channel */
+} rmt_channel_status_result_t;
+
 /**
  * @brief Data struct of RMT TX configure parameters
  */
@@ -128,6 +141,32 @@ typedef struct {
     rmt_tx_end_fn_t function; /*!< Function which is called on RMT TX end */
     void *arg;                /*!< Optional argument passed to function */
 } rmt_tx_end_callback_t;
+
+/**
+ * @brief User callback function to convert uint8_t type data to rmt format(rmt_item32_t).
+ *
+ *        This function may be called from an ISR, so, the code should be short and efficient.
+ *
+ * @param  src Pointer to the buffer storing the raw data that needs to be converted to rmt format.
+ *
+ * @param[out] dest Pointer to the buffer storing the rmt format data.
+ *
+ * @param  src_size The raw data size.
+ *
+ * @param  wanted_num The number of rmt format data that wanted to get.
+ *
+ * @param[out] translated_size The size of the raw data that has been converted to rmt format,
+ *             it should return 0 if no data is converted in user callback.
+ *
+ * @param[out] item_num The number of the rmt format data that actually converted to, it can be less than wanted_num if there is not enough raw data,
+ *             but cannot exceed wanted_num. it should return 0 if no data was converted.
+ *
+ *       @note
+ *       In fact, item_num should be a multiple of translated_size, e.g. :
+ *       When we convert each byte of uint8_t type data to rmt format data,
+ *       the relation between item_num and translated_size should be `item_num = translated_size*8`.
+ */
+typedef void (*sample_to_rmt_t)(const void* src, rmt_item32_t* dest, size_t src_size, size_t wanted_num, size_t* translated_size, size_t* item_num);
 
 /**
  * @brief Set RMT clock divider, channel clock is divided from source clock.
@@ -470,6 +509,7 @@ esp_err_t rmt_set_idle_level(rmt_channel_t channel, bool idle_out_en, rmt_idle_l
  * @param channel RMT channel (0-7)
  *
  * @param status Pointer to accept channel status.
+ *        Please refer to RMT_CHnSTATUS_REG(n=0~7) in `rmt_reg.h` for more details of each field.
  *
  * @return
  *     - ESP_ERR_INVALID_ARG Parameter error
@@ -632,6 +672,7 @@ esp_err_t rmt_fill_tx_items(rmt_channel_t channel, const rmt_item32_t* item, uin
  * @param rx_buf_size Size of RMT RX ringbuffer. Can be 0 if the RX ringbuffer is not used.
  *
  * @param intr_alloc_flags Flags for the RMT driver interrupt handler. Pass 0 for default flags. See esp_intr_alloc.h for details.
+ *        If ESP_INTR_FLAG_IRAM is used, please do not use the memory allocated from psram when calling rmt_write_items.
  *
  * @return
  *     - ESP_ERR_INVALID_STATE Driver is already installed, call rmt_driver_uninstall first.
@@ -653,6 +694,19 @@ esp_err_t rmt_driver_install(rmt_channel_t channel, size_t rx_buf_size, int intr
 esp_err_t rmt_driver_uninstall(rmt_channel_t channel);
 
 /**
+ * @brief Get the current status of eight channels.
+ *
+ * @note Do not call this function if it is possible that `rmt_driver_uninstall` will be called at the same time.
+ *
+ * @param[out] channel_status store the current status of each channel
+ *
+ * @return
+ *     - ESP_ERR_INVALID_ARG Parameter is NULL
+ *     - ESP_OK Success
+ */
+esp_err_t rmt_get_channel_status(rmt_channel_status_result_t *channel_status);
+
+/**
  * @brief RMT send waveform from rmt_item array.
  *
  *        This API allows user to send waveform with any length.
@@ -660,6 +714,7 @@ esp_err_t rmt_driver_uninstall(rmt_channel_t channel);
  * @param channel RMT channel (0 - 7)
  *
  * @param rmt_item head point of RMT items array.
+ *        If ESP_INTR_FLAG_IRAM is used, please do not use the memory allocated from psram when calling rmt_write_items.
  *
  * @param item_num RMT data item number.
  *
@@ -711,6 +766,39 @@ esp_err_t rmt_wait_tx_done(rmt_channel_t channel, TickType_t wait_time);
  *     - ESP_OK Success
  */
 esp_err_t rmt_get_ringbuf_handle(rmt_channel_t channel, RingbufHandle_t* buf_handle);
+
+/**
+ * @brief Init rmt translator and register user callback.
+ *        The callback will convert the raw data that needs to be sent to rmt format.
+ *        If a channel is initialized more than once, tha user callback will be replaced by the later.
+ *
+ * @param channel RMT channel (0 - 7).
+ *
+ * @param fn Point to the data conversion function.
+ *
+ * @return
+ *     - ESP_FAIL Init fail.
+ *     - ESP_OK Init success.
+ */
+esp_err_t rmt_translator_init(rmt_channel_t channel, sample_to_rmt_t fn);
+
+/**
+ * @brief Translate uint8_t type of data into rmt format and send it out.
+ *        Requires rmt_translator_init to init the translator first.
+ *
+ * @param channel RMT channel (0 - 7).
+ *
+ * @param src Pointer to the raw data.
+ *
+ * @param src_size The size of the raw data.
+ *
+ * @param wait_tx_done Set true to wait all data send done.
+ *
+ * @return
+ *     - ESP_FAIL Send fail
+ *     - ESP_OK Send success
+ */
+esp_err_t rmt_write_sample(rmt_channel_t channel, const uint8_t *src, size_t src_size, bool wait_tx_done);
 
 /**
  * @brief Registers a callback that will be called when transmission ends.

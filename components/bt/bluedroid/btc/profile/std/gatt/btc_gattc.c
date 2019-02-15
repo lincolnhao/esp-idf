@@ -14,13 +14,13 @@
 
 #include <string.h>
 
-#include "btm_ble_api.h"
+#include "stack/btm_ble_api.h"
 #include "btc_gattc.h"
 #include "btc_gatt_util.h"
-#include "btc_manage.h"
-#include "bta_gatt_api.h"
-#include "bt_trace.h"
-#include "allocator.h"
+#include "btc/btc_manage.h"
+#include "bta/bta_gatt_api.h"
+#include "common/bt_trace.h"
+#include "osi/allocator.h"
 #include "esp_gattc_api.h"
 
 #if (GATTC_INCLUDED == TRUE)
@@ -43,7 +43,7 @@ void btc_gattc_arg_deep_copy(btc_msg_t *msg, void *p_dest, void *p_src)
         if (dst->write_char.value) {
             memcpy(dst->write_char.value, src->write_char.value, src->write_char.value_len);
         } else {
-            LOG_ERROR("%s %d no mem\n", __func__, msg->act);
+            BTC_TRACE_ERROR("%s %d no mem\n", __func__, msg->act);
         }
         break;
     }
@@ -52,7 +52,7 @@ void btc_gattc_arg_deep_copy(btc_msg_t *msg, void *p_dest, void *p_src)
         if (dst->write_descr.value) {
             memcpy(dst->write_descr.value, src->write_descr.value, src->write_descr.value_len);
         } else {
-            LOG_ERROR("%s %d no mem\n", __func__, msg->act);
+            BTC_TRACE_ERROR("%s %d no mem\n", __func__, msg->act);
         }
         break;
     }
@@ -61,7 +61,7 @@ void btc_gattc_arg_deep_copy(btc_msg_t *msg, void *p_dest, void *p_src)
         if (dst->prep_write.value) {
             memcpy(dst->prep_write.value, src->prep_write.value, src->prep_write.value_len);
         } else {
-            LOG_ERROR("%s %d no mem\n", __func__, msg->act);
+            BTC_TRACE_ERROR("%s %d no mem\n", __func__, msg->act);
         }
         break;
     }
@@ -70,12 +70,12 @@ void btc_gattc_arg_deep_copy(btc_msg_t *msg, void *p_dest, void *p_src)
         if (dst->prep_write_descr.value) {
             memcpy(dst->prep_write_descr.value, src->prep_write_descr.value, src->prep_write_descr.value_len);
         } else {
-            LOG_ERROR("%s %d no mem\n", __func__, msg->act);
+            BTC_TRACE_ERROR("%s %d no mem\n", __func__, msg->act);
         }
         break;
     }
     default:
-        LOG_DEBUG("%s Unhandled deep copy %d\n", __func__, msg->act);
+        BTC_TRACE_DEBUG("%s Unhandled deep copy %d\n", __func__, msg->act);
         break;
     }
 }
@@ -110,7 +110,7 @@ void btc_gattc_arg_deep_free(btc_msg_t *msg)
         break;
     }
     default:
-        LOG_DEBUG("%s Unhandled deep free %d\n", __func__, msg->act);
+        BTC_TRACE_DEBUG("%s Unhandled deep free %d\n", __func__, msg->act);
         break;
     }
 
@@ -128,8 +128,8 @@ static void btc_gattc_copy_req_data(btc_msg_t *msg, void *p_dest, void *p_src)
     // Allocate buffer for request data if necessary
     switch (msg->act) {
         case BTA_GATTC_READ_DESCR_EVT:
-        case BTA_GATTC_READ_CHAR_EVT:
-        case BTA_GATTC_READ_MUTIPLE_EVT: {
+        case BTA_GATTC_READ_CHAR_EVT: 
+        case BTA_GATTC_READ_MULTIPLE_EVT: {
             if (p_src_data->read.p_value && p_src_data->read.p_value->p_value) {
                 p_dest_data->read.p_value = (tBTA_GATT_UNFMT  *)osi_malloc(sizeof(tBTA_GATT_UNFMT) + p_src_data->read.p_value->len);
                 p_dest_data->read.p_value->p_value = (uint8_t *)(p_dest_data->read.p_value + 1);
@@ -137,7 +137,19 @@ static void btc_gattc_copy_req_data(btc_msg_t *msg, void *p_dest, void *p_src)
                     p_dest_data->read.p_value->len = p_src_data->read.p_value->len;
                     memcpy(p_dest_data->read.p_value->p_value, p_src_data->read.p_value->p_value, p_src_data->read.p_value->len);
                 } else {
-                    LOG_ERROR("%s %d no mem\n", __func__, msg->act);
+                    BTC_TRACE_ERROR("%s %d no mem\n", __func__, msg->act);
+                }
+            }
+            break;
+        }
+        case BTA_GATTC_GET_ADDR_LIST_EVT: {
+            if (p_src_data->get_addr_list.bda_list != NULL) {
+                uint8_t num_addr = p_src_data->get_addr_list.num_addr;
+                p_dest_data->get_addr_list.bda_list = (BD_ADDR *)osi_malloc(sizeof(BD_ADDR) * num_addr);
+                if (p_dest_data->get_addr_list.bda_list) {
+                    memcpy(p_dest_data->get_addr_list.bda_list, p_src_data->get_addr_list.bda_list, sizeof(BD_ADDR) * num_addr);
+                } else {
+                    BTC_TRACE_ERROR("%s %d no mem\n", __func__, msg->act);
                 }
             }
             break;
@@ -152,10 +164,16 @@ static void btc_gattc_free_req_data(btc_msg_t *msg)
     tBTA_GATTC *arg = (tBTA_GATTC *)(msg->arg);
     switch (msg->act) {
         case BTA_GATTC_READ_DESCR_EVT:
-        case BTA_GATTC_READ_CHAR_EVT:
-        case BTA_GATTC_READ_MUTIPLE_EVT: {
+        case BTA_GATTC_READ_CHAR_EVT: 
+        case BTA_GATTC_READ_MULTIPLE_EVT: {
             if (arg->read.p_value) {
                 osi_free(arg->read.p_value);
+            }
+            break;
+        }
+        case BTA_GATTC_GET_ADDR_LIST_EVT: {
+            if (arg->get_addr_list.bda_list) {
+                osi_free(arg->get_addr_list.bda_list);
             }
             break;
         }
@@ -176,7 +194,7 @@ static void btc_gattc_cback(tBTA_GATTC_EVT event, tBTA_GATTC *p_data)
     ret = btc_transfer_context(&msg, p_data, sizeof(tBTA_GATTC), btc_gattc_copy_req_data);
 
     if (ret) {
-        LOG_ERROR("%s transfer failed\n", __func__);
+        BTC_TRACE_ERROR("%s transfer failed\n", __func__);
     }
 }
 
@@ -196,7 +214,7 @@ static void btc_gattc_app_unregister(btc_ble_gattc_args_t *arg)
 static void btc_gattc_open(btc_ble_gattc_args_t *arg)
 {
     tBTA_GATT_TRANSPORT transport = BTA_GATT_TRANSPORT_LE;
-    BTA_GATTC_Open(arg->open.gattc_if, arg->open.remote_bda, arg->open.is_direct, transport);
+    BTA_GATTC_Open(arg->open.gattc_if, arg->open.remote_bda, arg->open.remote_addr_type, arg->open.is_direct, transport);
 }
 
 static void btc_gattc_close(btc_ble_gattc_args_t *arg)
@@ -266,6 +284,7 @@ static void btc_gattc_fill_gatt_db_conversion(uint16_t count, uint16_t num, esp_
             for (int i = 0; i < db_size; i++) {
                 incl_result->handle = db[offset + i].attribute_handle;
                 incl_result->incl_srvc_s_handle = db[offset + i].start_handle;
+                incl_result->incl_srvc_e_handle = db[offset + i].end_handle;
                 btc128_to_bta_uuid(&bta_uuid, db[offset + i].uuid.uu);
                 bta_to_btc_uuid(&incl_result->uuid, &bta_uuid);
                 incl_result++;
@@ -273,7 +292,7 @@ static void btc_gattc_fill_gatt_db_conversion(uint16_t count, uint16_t num, esp_
             break;
         }
         default:
-            LOG_WARN("%s(), Not support type(%d)", __func__, type);
+            BTC_TRACE_WARNING("%s(), Not support type(%d)", __func__, type);
             break;
     }
 }
@@ -312,6 +331,7 @@ esp_gatt_status_t btc_ble_gattc_get_service(uint16_t conn_id, esp_bt_uuid_t *svc
         if (bta_uuid) {
             osi_free(bta_uuid);
         }
+        *count = 0;
         return status;
     } else {
         btc_gattc_fill_gatt_db_conversion(*count, (uint16_t)svc_num, ESP_GATT_DB_PRIMARY_SERVICE, offset, (void *)result, db);
@@ -343,6 +363,7 @@ esp_gatt_status_t btc_ble_gattc_get_all_char(uint16_t conn_id,
         if (db) {
             osi_free(db);
         }
+        *count = 0;
         return status;
     } else {
         btc_gattc_fill_gatt_db_conversion(*count, (uint16_t)char_num, ESP_GATT_DB_CHARACTERISTIC, offset, (void *)result, db);
@@ -370,6 +391,7 @@ esp_gatt_status_t btc_ble_gattc_get_all_descr(uint16_t conn_id,
         if (db) {
             osi_free(db);
         }
+        *count = 0;
         return status;
     } else {
         btc_gattc_fill_gatt_db_conversion(*count, (uint16_t)descr_num, ESP_GATT_DB_DESCRIPTOR, offset, (void *)result, db);
@@ -401,6 +423,7 @@ esp_gatt_status_t btc_ble_gattc_get_char_by_uuid(uint16_t conn_id,
         if (db) {
             osi_free(db);
         }
+        *count = 0;
         return status;
     } else {
         btc_gattc_fill_gatt_db_conversion(*count, (uint16_t)char_num, ESP_GATT_DB_CHARACTERISTIC, 0, (void *)result, db);
@@ -437,6 +460,7 @@ esp_gatt_status_t btc_ble_gattc_get_descr_by_uuid(uint16_t conn_id,
         if (db) {
             osi_free(db);
         }
+        *count = 0;
         return status;
     } else {
         btc_gattc_fill_gatt_db_conversion(*count, (uint16_t)descr_num, ESP_GATT_DB_DESCRIPTOR, 0, (void *)result, db);
@@ -468,6 +492,7 @@ esp_gatt_status_t btc_ble_gattc_get_descr_by_char_handle(uint16_t conn_id,
         if (db) {
             osi_free(db);
         }
+        *count = 0;
         return status;
     } else {
         btc_gattc_fill_gatt_db_conversion(*count, (uint16_t)descr_num, ESP_GATT_DB_DESCRIPTOR, 0, (void *)result, db);
@@ -505,6 +530,7 @@ esp_gatt_status_t btc_ble_gattc_get_include_service(uint16_t conn_id,
         if (db) {
             osi_free(db);
         }
+        *count = 0;
         return status;
     }else {
         btc_gattc_fill_gatt_db_conversion(*count, (uint16_t)incl_num, ESP_GATT_DB_INCLUDED_SERVICE, 0, (void *)result, db);
@@ -547,6 +573,7 @@ esp_gatt_status_t btc_ble_gattc_get_db(uint16_t conn_id, uint16_t start_handle, 
         if (get_db) {
             osi_free(get_db);
         }
+        *count = 0;
         return ESP_GATT_NOT_FOUND;
     }
 
@@ -560,7 +587,7 @@ esp_gatt_status_t btc_ble_gattc_get_db(uint16_t conn_id, uint16_t start_handle, 
         btc128_to_bta_uuid(&bta_uuid, get_db[i].uuid.uu);
         bta_to_btc_uuid(&db[i].uuid, &bta_uuid);
     }
-    *count = num;
+    *count = db_size;
     //don't forget to free the db buffer after used.
     if (get_db) {
         osi_free(get_db);
@@ -719,10 +746,19 @@ void btc_gattc_call_handler(btc_msg_t *msg)
         btc_gattc_unreg_for_notify(arg);
         break;
     case BTC_GATTC_ACT_CACHE_REFRESH:
-        BTA_GATTC_Refresh(arg->cache_refresh.remote_bda);
+        BTA_GATTC_Refresh(arg->cache_refresh.remote_bda, true);
+        break;
+    case BTC_GATTC_ACT_CACHE_ASSOC:
+        BTA_GATTC_CacheAssoc(arg->cache_assoc.gattc_if,
+                                arg->cache_assoc.src_addr,
+                                arg->cache_assoc.assoc_addr,
+                                arg->cache_assoc.is_assoc);
+        break;
+    case BTC_GATTC_ATC_CACHE_GET_ADDR_LIST:
+        BTA_GATTC_CacheGetAddrList(arg->get_addr_list.gattc_if);
         break;
     default:
-        LOG_ERROR("%s: Unhandled event (%d)!\n", __FUNCTION__, msg->act);
+        BTC_TRACE_ERROR("%s: Unhandled event (%d)!\n", __FUNCTION__, msg->act);
         break;
     }
 
@@ -790,6 +826,7 @@ void btc_gattc_cb_handler(btc_msg_t *msg)
         gattc_if = BTC_GATT_GET_GATT_IF(search_cmpl->conn_id);
         param.search_cmpl.conn_id = BTC_GATT_GET_CONN_ID(search_cmpl->conn_id);
         param.search_cmpl.status = search_cmpl->status;
+        param.search_cmpl.searched_service_source = search_cmpl->searched_service_source;
         btc_gattc_cb_to_app(ESP_GATTC_SEARCH_CMPL_EVT, gattc_if, &param);
         break;
     }
@@ -800,6 +837,7 @@ void btc_gattc_cb_handler(btc_msg_t *msg)
         param.search_res.conn_id = BTC_GATT_GET_CONN_ID(srvc_res->conn_id);
         param.search_res.start_handle = srvc_res->start_handle;
         param.search_res.end_handle = srvc_res->end_handle;
+        param.search_res.is_primary = srvc_res->is_primary;
         bta_to_btc_gatt_id(&param.search_res.srvc_id, &srvc_res->service_uuid);
         btc_gattc_cb_to_app(ESP_GATTC_SEARCH_RES_EVT, gattc_if, &param);
         break;
@@ -809,9 +847,9 @@ void btc_gattc_cb_handler(btc_msg_t *msg)
         btc_gattc_cb_to_app(ESP_GATTC_READ_DESCR_EVT, gattc_if, &param);
         break;
     }
-    case BTA_GATTC_READ_MUTIPLE_EVT: {
+    case BTA_GATTC_READ_MULTIPLE_EVT: {
         set_read_value(&gattc_if, &param, &arg->read);
-        btc_gattc_cb_to_app(ESP_GATTC_READ_MUTIPLE_EVT, gattc_if, &param);
+        btc_gattc_cb_to_app(ESP_GATTC_READ_MULTIPLE_EVT, gattc_if, &param);
         break;
     }
     case BTA_GATTC_WRITE_DESCR_EVT: {
@@ -913,8 +951,10 @@ void btc_gattc_cb_handler(btc_msg_t *msg)
         break;
     }
     case BTA_GATTC_SRVC_CHG_EVT: {
-        memcpy(param.srvc_chg.remote_bda, arg->remote_bda, sizeof(esp_bd_addr_t));
-        btc_gattc_cb_to_app(ESP_GATTC_SRVC_CHG_EVT, ESP_GATT_IF_NONE, &param);
+        tBTA_GATTC_SERVICE_CHANGE *srvc_change = &arg->srvc_chg;
+        gattc_if = BTC_GATT_GET_GATT_IF(srvc_change->conn_id);
+        memcpy(param.srvc_chg.remote_bda, srvc_change->remote_bda, sizeof(esp_bd_addr_t));
+        btc_gattc_cb_to_app(ESP_GATTC_SRVC_CHG_EVT, gattc_if, &param);
         break;
     }
     case BTA_GATTC_QUEUE_FULL_EVT: {
@@ -926,8 +966,22 @@ void btc_gattc_cb_handler(btc_msg_t *msg)
         btc_gattc_cb_to_app(ESP_GATTC_QUEUE_FULL_EVT, gattc_if, &param);
         break;
     }
+    case BTA_GATTC_ASSOC_EVT: {
+        gattc_if = arg->set_assoc.client_if;
+        param.set_assoc_cmp.status = arg->set_assoc.status;
+        btc_gattc_cb_to_app(ESP_GATTC_SET_ASSOC_EVT, gattc_if, &param);
+        break;
+    }
+    case BTA_GATTC_GET_ADDR_LIST_EVT: {
+        gattc_if = arg->get_addr_list.client_if;
+        param.get_addr_list.status = arg->get_addr_list.status;
+        param.get_addr_list.num_addr = arg->get_addr_list.num_addr;
+        param.get_addr_list.addr_list = arg->get_addr_list.bda_list;
+        btc_gattc_cb_to_app(ESP_GATTC_GET_ADDR_LIST_EVT, gattc_if, &param);
+        break;
+    }
     default:
-        LOG_DEBUG("%s: Unhandled event (%d)!", __FUNCTION__, msg->act);
+        BTC_TRACE_DEBUG("%s: Unhandled event (%d)!", __FUNCTION__, msg->act);
         break;
     }
 

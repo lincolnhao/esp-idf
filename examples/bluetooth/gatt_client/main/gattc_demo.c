@@ -10,9 +10,9 @@
 
 /****************************************************************************
 *
-* This file is for gatt client. It can scan ble device, connect one device.
+* This demo showcases BLE GATT client. It can scan BLE devices and connect to one device.
 * Run the gatt_server demo, the client demo will automatically connect to the gatt_server demo.
-* Client demo will enable gatt_server's notify after connection. Then the two devices will exchange
+* Client demo will enable gatt_server's notify after connection. The two devices will then exchange
 * data.
 *
 ****************************************************************************/
@@ -23,7 +23,6 @@
 #include <stdio.h>
 #include "nvs.h"
 #include "nvs_flash.h"
-#include "controller.h"
 
 #include "esp_bt.h"
 #include "esp_gap_ble_api.h"
@@ -31,6 +30,8 @@
 #include "esp_gatt_defs.h"
 #include "esp_bt_main.h"
 #include "esp_gatt_common_api.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 
 #define GATTC_TAG "GATTC_DEMO"
 #define REMOTE_SERVICE_UUID        0x00FF
@@ -45,7 +46,7 @@ static bool get_server = false;
 static esp_gattc_char_elem_t *char_elem_result   = NULL;
 static esp_gattc_descr_elem_t *descr_elem_result = NULL;
 
-/* eclare static functions */
+/* Declare static functions */
 static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
 static void esp_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
 static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
@@ -71,7 +72,8 @@ static esp_ble_scan_params_t ble_scan_params = {
     .own_addr_type          = BLE_ADDR_TYPE_PUBLIC,
     .scan_filter_policy     = BLE_SCAN_FILTER_ALLOW_ALL,
     .scan_interval          = 0x50,
-    .scan_window            = 0x30
+    .scan_window            = 0x30,
+    .scan_duplicate         = BLE_SCAN_DUPLICATE_DISABLE
 };
 
 struct gattc_profile_inst {
@@ -132,14 +134,14 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         esp_ble_gattc_search_service(gattc_if, param->cfg_mtu.conn_id, &remote_filter_service_uuid);
         break;
     case ESP_GATTC_SEARCH_RES_EVT: {
-        ESP_LOGI(GATTC_TAG, "ESP_GATTC_SEARCH_RES_EVT");
-        esp_gatt_srvc_id_t *srvc_id =(esp_gatt_srvc_id_t *)&p_data->search_res.srvc_id;
-        if (srvc_id->id.uuid.len == ESP_UUID_LEN_16 && srvc_id->id.uuid.uuid.uuid16 == REMOTE_SERVICE_UUID) {
+        ESP_LOGI(GATTC_TAG, "SEARCH RES: conn_id = %x is primary service %d", p_data->search_res.conn_id, p_data->search_res.is_primary);
+        ESP_LOGI(GATTC_TAG, "start handle %d end handle %d current handle value %d", p_data->search_res.start_handle, p_data->search_res.end_handle, p_data->search_res.srvc_id.inst_id);
+        if (p_data->search_res.srvc_id.uuid.len == ESP_UUID_LEN_16 && p_data->search_res.srvc_id.uuid.uuid.uuid16 == REMOTE_SERVICE_UUID) {
             ESP_LOGI(GATTC_TAG, "service found");
             get_server = true;
             gl_profile_tab[PROFILE_A_APP_ID].service_start_handle = p_data->search_res.start_handle;
             gl_profile_tab[PROFILE_A_APP_ID].service_end_handle = p_data->search_res.end_handle;
-            ESP_LOGI(GATTC_TAG, "UUID16: %x", srvc_id->id.uuid.uuid.uuid16);
+            ESP_LOGI(GATTC_TAG, "UUID16: %x", p_data->search_res.srvc_id.uuid.uuid.uuid16);
         }
         break;
     }
@@ -147,6 +149,13 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         if (p_data->search_cmpl.status != ESP_GATT_OK){
             ESP_LOGE(GATTC_TAG, "search service failed, error status = %x", p_data->search_cmpl.status);
             break;
+        }
+        if(p_data->search_cmpl.searched_service_source == ESP_GATT_SERVICE_FROM_REMOTE_DEVICE) {
+            ESP_LOGI(GATTC_TAG, "Get service information from remote device");
+        } else if (p_data->search_cmpl.searched_service_source == ESP_GATT_SERVICE_FROM_NVS_FLASH) {
+            ESP_LOGI(GATTC_TAG, "Get service information from flash");
+        } else {
+            ESP_LOGI(GATTC_TAG, "unknown service source");
         }
         ESP_LOGI(GATTC_TAG, "ESP_GATTC_SEARCH_CMPL_EVT");
         if (get_server){
@@ -222,7 +231,6 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
                     if (ret_status != ESP_GATT_OK){
                         ESP_LOGE(GATTC_TAG, "esp_ble_gattc_get_descr_by_char_handle error");
                     }
-
                     /* Every char has only one descriptor in our 'ESP_GATTS_DEMO' demo, so we used first 'descr_elem_result' */
                     if (count > 0 && descr_elem_result[0].uuid.len == ESP_UUID_LEN_16 && descr_elem_result[0].uuid.uuid.uuid16 == ESP_GATT_UUID_CHAR_CLIENT_CONFIG){
                         ret_status = esp_ble_gattc_write_char_descr( gattc_if,
@@ -330,7 +338,19 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
                                                 ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
             ESP_LOGI(GATTC_TAG, "searched Device Name Len %d", adv_name_len);
             esp_log_buffer_char(GATTC_TAG, adv_name, adv_name_len);
+
+#if CONFIG_EXAMPLE_DUMP_ADV_DATA_AND_SCAN_RESP
+            if (scan_result->scan_rst.adv_data_len > 0) {
+                ESP_LOGI(GATTC_TAG, "adv data:");
+                esp_log_buffer_hex(GATTC_TAG, &scan_result->scan_rst.ble_adv[0], scan_result->scan_rst.adv_data_len);
+            }
+            if (scan_result->scan_rst.scan_rsp_len > 0) {
+                ESP_LOGI(GATTC_TAG, "scan resp:");
+                esp_log_buffer_hex(GATTC_TAG, &scan_result->scan_rst.ble_adv[scan_result->scan_rst.adv_data_len], scan_result->scan_rst.scan_rsp_len);
+            }
+#endif
             ESP_LOGI(GATTC_TAG, "\n");
+
             if (adv_name != NULL) {
                 if (strlen(remote_device_name) == adv_name_len && strncmp((char *)adv_name, remote_device_name, adv_name_len) == 0) {
                     ESP_LOGI(GATTC_TAG, "searched device %s\n", remote_device_name);
@@ -338,7 +358,7 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
                         connect = true;
                         ESP_LOGI(GATTC_TAG, "connect to the remote device.");
                         esp_ble_gap_stop_scanning();
-                        esp_ble_gattc_open(gl_profile_tab[PROFILE_A_APP_ID].gattc_if, scan_result->scan_rst.bda, true);
+                        esp_ble_gattc_open(gl_profile_tab[PROFILE_A_APP_ID].gattc_if, scan_result->scan_rst.bda, scan_result->scan_rst.ble_addr_type, true);
                     }
                 }
             }
@@ -413,7 +433,7 @@ void app_main()
 {
     // Initialize NVS.
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }

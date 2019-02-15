@@ -19,17 +19,17 @@
 //#define LOG_TAG "bt_btm_ble"
 
 #include <string.h>
-#include "bt_target.h"
+#include "common/bt_target.h"
 
 #if (BLE_INCLUDED == TRUE)
-#include "bt_types.h"
-#include "hcimsgs.h"
-#include "btu.h"
+#include "stack/bt_types.h"
+#include "stack/hcimsgs.h"
+#include "stack/btu.h"
 #include "btm_int.h"
-#include "allocator.h"
-#include "hcidefs.h"
-#include "btm_ble_api.h"
-#include "controller.h"
+#include "osi/allocator.h"
+#include "stack/hcidefs.h"
+#include "stack/btm_ble_api.h"
+#include "device/controller.h"
 
 #define BTM_BLE_ADV_FILT_META_HDR_LENGTH 3
 #define BTM_BLE_ADV_FILT_FEAT_SELN_LEN  13
@@ -331,8 +331,8 @@ void btm_ble_scan_pf_cmpl_cback(tBTM_VSC_CMPL *p_params)
         break;
     }
 
+    BTM_TRACE_DEBUG("btm_ble_scan_pf_cmpl_cback: calling the cback: %d", cb_evt);
     switch (cb_evt) {
-        BTM_TRACE_DEBUG("btm_ble_scan_pf_cmpl_cback: calling the cback: %d", cb_evt);
     case BTM_BLE_FILT_CFG:
         if (NULL != p_scan_cfg_cback) {
             p_scan_cfg_cback(action, cond_type, num_avail, status, ref_value);

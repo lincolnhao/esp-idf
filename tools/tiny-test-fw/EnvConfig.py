@@ -53,7 +53,7 @@ class Config(object):
         try:
             with open(config_file) as f:
                 configs = yaml.load(f)[env_name]
-        except (OSError, TypeError):
+        except (OSError, TypeError, IOError):
             configs = dict()
         return configs
 
@@ -67,7 +67,7 @@ class Config(object):
         try:
             value = self.configs[variable_name]
         except KeyError:
-            #TODO: to support auto get variable here
+            # TODO: to support auto get variable here
             value = None
         if value is None:
             raise ValueError("Failed to get variable")

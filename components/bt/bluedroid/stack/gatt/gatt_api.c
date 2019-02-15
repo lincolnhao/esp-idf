@@ -21,19 +21,19 @@
  *  this file contains GATT interface functions
  *
  ******************************************************************************/
-#include "bt_target.h"
+#include "common/bt_target.h"
 
 
 #if defined(BTA_GATT_INCLUDED) && (BTA_GATT_INCLUDED == TRUE)
 
-#include "allocator.h"
+#include "osi/allocator.h"
 #include <string.h>
-#include "gatt_api.h"
+#include "stack/gatt_api.h"
 #include "gatt_int.h"
-#include "l2c_api.h"
+#include "stack/l2c_api.h"
 #include "btm_int.h"
-#include "sdpdefs.h"
-#include "sdp_api.h"
+#include "stack/sdpdefs.h"
+#include "stack/sdp_api.h"
 
 /*******************************************************************************
 **
@@ -398,7 +398,9 @@ BOOLEAN GATTS_DeleteService (tGATT_IF gatt_if, tBT_UUID *p_svc_uuid, UINT16 svc_
         GATT_TRACE_DEBUG ("Delete a new service changed item - the service has not yet started");
         osi_free(fixed_queue_try_remove_from_queue(gatt_cb.pending_new_srv_start_q, p_buf));
     } else {
-        gatt_proc_srv_chg();
+        if (GATTS_SEND_SERVICE_CHANGE_MODE == GATTS_SEND_SERVICE_CHANGE_AUTO) {
+            gatt_proc_srv_chg();
+        }
     }
 
     if ((i_sreg = gatt_sr_find_i_rcb_by_app_id (p_app_uuid128,
@@ -508,7 +510,9 @@ tGATT_STATUS GATTS_StartService (tGATT_IF gatt_if, UINT16 service_handle,
     if ( (p_buf = gatt_sr_is_new_srv_chg(&p_list->asgn_range.app_uuid128,
                                          &p_list->asgn_range.svc_uuid,
                                          p_list->asgn_range.svc_inst)) != NULL) {
-        gatt_proc_srv_chg();
+        if (GATTS_SEND_SERVICE_CHANGE_MODE == GATTS_SEND_SERVICE_CHANGE_AUTO) {
+            gatt_proc_srv_chg();
+        }
         /* remove the new service element after the srv changed processing is completed*/
 
         osi_free(fixed_queue_try_remove_from_queue(gatt_cb.pending_new_srv_start_q, p_buf));
@@ -762,7 +766,8 @@ tGATT_STATUS GATTS_GetAttributeValue(UINT16 attr_handle, UINT16 *length, UINT8 *
                     attr_handle);
 
      if ((p_decl = gatt_find_hdl_buffer_by_attr_handle(attr_handle)) == NULL) {
-         GATT_TRACE_ERROR("Service not created\n"); 
+         GATT_TRACE_ERROR("Service not created\n");
+         *length = 0;
          return GATT_INVALID_HANDLE;
      }
 
@@ -1337,12 +1342,13 @@ void GATT_StartIf (tGATT_IF gatt_if)
 **
 ** Parameters       gatt_if: applicaiton interface
 **                  bd_addr: peer device address.
+**                  bd_addr_type: peer device address type.
 **                  is_direct: is a direct conenection or a background auto connection
 **
 ** Returns          TRUE if connection started; FALSE if connection start failure.
 **
 *******************************************************************************/
-BOOLEAN GATT_Connect (tGATT_IF gatt_if, BD_ADDR bd_addr, BOOLEAN is_direct, tBT_TRANSPORT transport)
+BOOLEAN GATT_Connect (tGATT_IF gatt_if, BD_ADDR bd_addr, tBLE_ADDR_TYPE bd_addr_type, BOOLEAN is_direct, tBT_TRANSPORT transport)
 {
     tGATT_REG    *p_reg;
     BOOLEAN status = FALSE;
@@ -1356,7 +1362,7 @@ BOOLEAN GATT_Connect (tGATT_IF gatt_if, BD_ADDR bd_addr, BOOLEAN is_direct, tBT_
     }
 
     if (is_direct) {
-        status = gatt_act_connect (p_reg, bd_addr, transport);
+        status = gatt_act_connect (p_reg, bd_addr, bd_addr_type, transport);
     } else {
         if (transport == BT_TRANSPORT_LE) {
             status = gatt_update_auto_connect_dev(gatt_if, TRUE, bd_addr, TRUE);
@@ -1467,6 +1473,51 @@ tGATT_STATUS GATT_Disconnect (UINT16 conn_id)
     return ret;
 }
 
+/*******************************************************************************
+**
+** Function         GATT_SendServiceChangeIndication
+**
+** Description      This function is to send a service change indication
+**
+** Parameters       bd_addr: peer device address.
+**
+** Returns          None.
+**
+*******************************************************************************/
+tGATT_STATUS GATT_SendServiceChangeIndication (BD_ADDR bd_addr)
+{
+    UINT8               start_idx, found_idx;
+    BOOLEAN             srv_chg_ind_pending = FALSE;
+    tGATT_TCB           *p_tcb;
+    tBT_TRANSPORT      transport;
+    tGATT_STATUS status = GATT_NOT_FOUND;
+    if (GATTS_SEND_SERVICE_CHANGE_MODE == GATTS_SEND_SERVICE_CHANGE_AUTO) {
+        status = GATT_WRONG_STATE;
+        GATT_TRACE_ERROR ("%s can't send service change indication manually, please configure the option through menuconfig", __func__);
+        return status;
+    }
+
+    if(bd_addr) {
+         status = gatt_send_srv_chg_ind(bd_addr);
+    } else {
+        start_idx = 0;
+        BD_ADDR addr;
+        while (gatt_find_the_connected_bda(start_idx, addr, &found_idx, &transport)) {
+            p_tcb = &gatt_cb.tcb[found_idx];
+            srv_chg_ind_pending = gatt_is_srv_chg_ind_pending(p_tcb);
+
+            if (!srv_chg_ind_pending) {
+                status = gatt_send_srv_chg_ind(addr);    
+            } else {
+                status = GATT_BUSY;
+                GATT_TRACE_DEBUG("discard srv chg - already has one in the queue");
+            }
+            start_idx = ++found_idx;
+        }
+    }
+
+    return status;
+}
 
 /*******************************************************************************
 **

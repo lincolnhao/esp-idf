@@ -22,15 +22,15 @@
  *
  ******************************************************************************/
 
-#include "bt_target.h"
+#include "common/bt_target.h"
 
 #if BLE_INCLUDED == TRUE
 
 #include "gatt_int.h"
-#include "l2c_api.h"
+#include "stack/l2c_api.h"
 #include "btm_int.h"
 #include "btm_ble_int.h"
-#include "allocator.h"
+#include "osi/allocator.h"
 
 /* Configuration flags. */
 #define GATT_L2C_CFG_IND_DONE   (1<<0)
@@ -108,9 +108,9 @@ void gatt_init (void)
     gatt_cb.trace_level = BT_TRACE_LEVEL_NONE;    /* No traces */
 #endif
     gatt_cb.def_mtu_size = GATT_DEF_BLE_MTU_SIZE;
-    gatt_cb.sign_op_queue = fixed_queue_new(SIZE_MAX);
-    gatt_cb.srv_chg_clt_q = fixed_queue_new(SIZE_MAX);
-    gatt_cb.pending_new_srv_start_q = fixed_queue_new(SIZE_MAX);
+    gatt_cb.sign_op_queue = fixed_queue_new(QUEUE_SIZE_MAX);
+    gatt_cb.srv_chg_clt_q = fixed_queue_new(QUEUE_SIZE_MAX);
+    gatt_cb.pending_new_srv_start_q = fixed_queue_new(QUEUE_SIZE_MAX);
     /* First, register fixed L2CAP channel for ATT over BLE */
     fixed_reg.fixed_chnl_opts.mode         = L2CAP_FCR_BASIC_MODE;
     fixed_reg.fixed_chnl_opts.max_transmit = 0xFF;
@@ -179,7 +179,7 @@ void gatt_free(void)
 
         btu_free_timer(&gatt_cb.tcb[i].ind_ack_timer_ent);
         memset(&gatt_cb.tcb[i].ind_ack_timer_ent, 0, sizeof(TIMER_LIST_ENT));
-    
+
 #if (GATTS_INCLUDED == TRUE)
         fixed_queue_free(gatt_cb.tcb[i].sr_cmd.multi_rsp_q, NULL);
         gatt_cb.tcb[i].sr_cmd.multi_rsp_q = NULL;
@@ -188,6 +188,8 @@ void gatt_free(void)
 
 #if (GATTS_INCLUDED == TRUE)
     for (i = 0; i < GATT_MAX_SR_PROFILES; i++) {
+        gatt_remove_an_item_from_list(&gatt_cb.hdl_list_info, &gatt_cb.hdl_list[i]);
+        gatt_free_attr_value_buffer(&gatt_cb.hdl_list[i]);
         gatt_free_hdl_buffer(&gatt_cb.hdl_list[i]);
     }
 #endif /* #if (GATTS_INCLUDED == TRUE) */
@@ -204,11 +206,11 @@ void gatt_free(void)
 ** Description      This function is called to initiate a connection to a peer device.
 **
 ** Parameter        rem_bda: remote device address to connect to.
-**
+**                  bd_addr_type: emote device address type.
 ** Returns          TRUE if connection is started, otherwise return FALSE.
 **
 *******************************************************************************/
-BOOLEAN gatt_connect (BD_ADDR rem_bda, tGATT_TCB *p_tcb, tBT_TRANSPORT transport)
+BOOLEAN gatt_connect (BD_ADDR rem_bda, tBLE_ADDR_TYPE bd_addr_type, tGATT_TCB *p_tcb, tBT_TRANSPORT transport)
 {
     BOOLEAN             gatt_ret = FALSE;
 
@@ -218,7 +220,7 @@ BOOLEAN gatt_connect (BD_ADDR rem_bda, tGATT_TCB *p_tcb, tBT_TRANSPORT transport
 
     if (transport == BT_TRANSPORT_LE) {
         p_tcb->att_lcid = L2CAP_ATT_CID;
-        gatt_ret = L2CA_ConnectFixedChnl (L2CAP_ATT_CID, rem_bda);
+        gatt_ret = L2CA_ConnectFixedChnl (L2CAP_ATT_CID, rem_bda, bd_addr_type);
 #if (CLASSIC_BT_INCLUDED == TRUE)
     } else {
         if ((p_tcb->att_lcid = L2CA_ConnectReq(BT_PSM_ATT, rem_bda)) != 0) {
@@ -363,7 +365,7 @@ void gatt_update_app_use_link_flag (tGATT_IF gatt_if, tGATT_TCB *p_tcb, BOOLEAN 
 ** Returns          void.
 **
 *******************************************************************************/
-BOOLEAN gatt_act_connect (tGATT_REG *p_reg, BD_ADDR bd_addr, tBT_TRANSPORT transport)
+BOOLEAN gatt_act_connect (tGATT_REG *p_reg, BD_ADDR bd_addr, tBLE_ADDR_TYPE bd_addr_type, tBT_TRANSPORT transport)
 {
     BOOLEAN     ret = FALSE;
     tGATT_TCB   *p_tcb;
@@ -376,7 +378,7 @@ BOOLEAN gatt_act_connect (tGATT_REG *p_reg, BD_ADDR bd_addr, tBT_TRANSPORT trans
         /* before link down, another app try to open a GATT connection */
         if (st == GATT_CH_OPEN &&  gatt_num_apps_hold_link(p_tcb) == 0 &&
                 transport == BT_TRANSPORT_LE ) {
-            if (!gatt_connect(bd_addr,  p_tcb, transport)) {
+            if (!gatt_connect(bd_addr, bd_addr_type, p_tcb, transport)) {
                 ret = FALSE;
             }
         } else if (st == GATT_CH_CLOSING) {
@@ -385,7 +387,7 @@ BOOLEAN gatt_act_connect (tGATT_REG *p_reg, BD_ADDR bd_addr, tBT_TRANSPORT trans
         }
     } else {
         if ((p_tcb = gatt_allocate_tcb_by_bdaddr(bd_addr, transport)) != NULL) {
-            if (!gatt_connect(bd_addr,  p_tcb, transport)) {
+            if (!gatt_connect(bd_addr, bd_addr_type, p_tcb, transport)) {
                 GATT_TRACE_ERROR("gatt_connect failed");
                 fixed_queue_free(p_tcb->pending_enc_clcb, NULL);
                 fixed_queue_free(p_tcb->pending_ind_q, NULL);
@@ -979,7 +981,12 @@ void gatt_data_process (tGATT_TCB *p_tcb, BT_HDR *p_buf)
                 }
             }
         } else {
-            GATT_TRACE_ERROR ("ATT - Rcvd L2CAP data, unknown cmd: 0x%x\n", op_code);
+            if (op_code & GATT_COMMAND_FLAG) {
+                GATT_TRACE_ERROR ("ATT - Rcvd L2CAP data, unknown cmd: 0x%x\n", op_code);
+            } else {
+                GATT_TRACE_ERROR ("ATT - Rcvd L2CAP data, unknown req: 0x%x\n", op_code);
+                gatt_send_error_rsp (p_tcb, GATT_REQ_NOT_SUPPORTED, op_code, 0, FALSE);
+            }
         }
     } else {
         GATT_TRACE_ERROR ("invalid data length, ignore\n");
@@ -1017,35 +1024,36 @@ void gatt_add_a_bonded_dev_for_srv_chg (BD_ADDR bda)
 **
 ** Function         gatt_send_srv_chg_ind
 **
-** Description      This function is called to send a service chnaged indication to
+** Description      This function is called to send a service changed indication to
 **                  the specified bd address
 **
-** Returns          void
+** Returns          GATT_SUCCESS if sucessfully sent; otherwise error code
 **
 *******************************************************************************/
 #if (GATTS_INCLUDED == TRUE)
-void gatt_send_srv_chg_ind (BD_ADDR peer_bda)
+tGATT_STATUS gatt_send_srv_chg_ind (BD_ADDR peer_bda)
 {
     UINT8   handle_range[GATT_SIZE_OF_SRV_CHG_HNDL_RANGE];
     UINT8   *p = handle_range;
     UINT16  conn_id;
-
+    tGATT_STATUS  status = GATT_ERROR;
     GATT_TRACE_DEBUG("gatt_send_srv_chg_ind");
 
     if (gatt_cb.handle_of_h_r) {
         if ((conn_id = gatt_profile_find_conn_id_by_bd_addr(peer_bda)) != GATT_INVALID_CONN_ID) {
             UINT16_TO_STREAM (p, 1);
             UINT16_TO_STREAM (p, 0xFFFF);
-            GATTS_HandleValueIndication (conn_id,
+            status = GATTS_HandleValueIndication (conn_id,
                                          gatt_cb.handle_of_h_r,
                                          GATT_SIZE_OF_SRV_CHG_HNDL_RANGE,
                                          handle_range);
         } else {
-            GATT_TRACE_ERROR("Unable to find conn_id for  %08x%04x ",
-                             (peer_bda[0] << 24) + (peer_bda[1] << 16) + (peer_bda[2] << 8) + peer_bda[3],
-                             (peer_bda[4] << 8) + peer_bda[5] );
+            status = GATT_NOT_FOUND;
+            GATT_TRACE_ERROR("Unable to find conn_id for  %02x%02x%02x%02x%02x%02x ",
+                             peer_bda[0], peer_bda[1],  peer_bda[2], peer_bda[3], peer_bda[4], peer_bda[5]);
         }
     }
+    return status;
 }
 
 
@@ -1053,7 +1061,7 @@ void gatt_send_srv_chg_ind (BD_ADDR peer_bda)
 **
 ** Function         gatt_chk_srv_chg
 **
-** Description      Check sending service chnaged Indication is required or not
+** Description      Check sending service changed Indication is required or not
 **                  if required then send the Indication
 **
 ** Returns          void
@@ -1137,7 +1145,7 @@ void gatt_proc_srv_chg (void)
         gatt_set_srv_chg();
         start_idx = 0;
         while (gatt_find_the_connected_bda(start_idx, bda, &found_idx, &transport)) {
-            p_tcb = &gatt_cb.tcb[found_idx];;
+            p_tcb = &gatt_cb.tcb[found_idx];
             srv_chg_ind_pending  = gatt_is_srv_chg_ind_pending(p_tcb);
 
             if (!srv_chg_ind_pending) {

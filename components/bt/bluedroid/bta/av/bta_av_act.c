@@ -23,24 +23,24 @@
  *
  ******************************************************************************/
 
-#include "bt_target.h"
+#include "common/bt_target.h"
 #if defined(BTA_AV_INCLUDED) && (BTA_AV_INCLUDED == TRUE)
 
 #include <string.h>
-#include "bta_av_api.h"
+#include "bta/bta_av_api.h"
 #include "bta_av_int.h"
-#include "avdt_api.h"
-#include "utl.h"
-#include "l2c_api.h"
-#include "allocator.h"
-#include "list.h"
+#include "stack/avdt_api.h"
+#include "bta/utl.h"
+#include "stack/l2c_api.h"
+#include "osi/allocator.h"
+#include "osi/list.h"
 #if( defined BTA_AR_INCLUDED ) && (BTA_AR_INCLUDED == TRUE)
-#include "bta_ar_api.h"
+#include "bta/bta_ar_api.h"
 #endif
 
 #define LOG_TAG "bt_bta_av"
 // #include "osi/include/log.h"
-#include "bt_trace.h"
+#include "common/bt_trace.h"
 
 /*****************************************************************************
 **  Constants
@@ -1870,8 +1870,14 @@ void bta_av_dereg_comp(tBTA_AV_DATA *p_data)
             bta_av_cb.features  = 0;
         }
 
-        /* Clear the Capturing service class bit */
-        cod.service = BTM_COD_SERVICE_CAPTURING;
+        /* Clear the Capturing/Rendering service class bit */
+        if (p_data->api_reg.tsep == AVDT_TSEP_SRC) {
+            cod.service = BTM_COD_SERVICE_CAPTURING | BTM_COD_SERVICE_AUDIO;
+        } else {
+#if (BTA_AV_SINK_INCLUDED == TRUE)
+            cod.service = BTM_COD_SERVICE_RENDERING | BTM_COD_SERVICE_AUDIO;
+#endif
+        }
         utl_set_device_class(&cod, BTA_UTL_CLR_COD_SERVICE_CLASS);
     }
 }

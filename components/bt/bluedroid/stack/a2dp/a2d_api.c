@@ -22,12 +22,12 @@
  *
  ******************************************************************************/
 #include <string.h>
-#include "bt_target.h"
-#include "sdpdefs.h"
-#include "a2d_api.h"
+#include "common/bt_target.h"
+#include "stack/sdpdefs.h"
+#include "stack/a2d_api.h"
 #include "a2d_int.h"
-#include "avdt_api.h"
-#include "allocator.h"
+#include "stack/avdt_api.h"
+#include "osi/allocator.h"
 
 #if (defined(A2D_INCLUDED) && A2D_INCLUDED == TRUE)
 
@@ -352,8 +352,8 @@ UINT8 A2D_SetTraceLevel (UINT8 new_level)
 ******************************************************************************/
 UINT8 A2D_BitsSet(UINT8 num)
 {
-    UINT8   count;
-    BOOLEAN res;
+    UINT8 count;
+    UINT8 res;
     if (num == 0) {
         res = A2D_SET_ZERO_BIT;
     } else {

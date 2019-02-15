@@ -45,7 +45,7 @@ import json
 
 import yaml
 
-from Utility import (CaseConfig, SearchCases, GitlabCIJob)
+from Utility import (CaseConfig, SearchCases, GitlabCIJob, console_log)
 
 
 class Group(object):
@@ -53,11 +53,18 @@ class Group(object):
     MAX_EXECUTION_TIME = 30
     MAX_CASE = 15
     SORT_KEYS = ["env_tag"]
+    # Matching CI job rules could be different from the way we want to group test cases.
+    # For example, when assign unit test cases, different test cases need to use different test functions.
+    # We need to put them into different groups.
+    # But these groups can be assigned to jobs with same tags, as they use the same test environment.
+    CI_JOB_MATCH_KEYS = SORT_KEYS
 
     def __init__(self, case):
         self.execution_time = 0
         self.case_list = [case]
         self.filters = dict(zip(self.SORT_KEYS, [self._get_case_attr(case, x) for x in self.SORT_KEYS]))
+        # we use ci_job_match_keys to match CI job tags. It's a set of required tags.
+        self.ci_job_match_keys = set([self._get_case_attr(case, x) for x in self.CI_JOB_MATCH_KEYS])
 
     @staticmethod
     def _get_case_attr(case, attr):
@@ -115,6 +122,11 @@ class AssignTest(object):
     """
     # subclass need to rewrite CI test job pattern, to filter all test jobs
     CI_TEST_JOB_PATTERN = re.compile(r"^test_.+")
+    # by default we only run function in CI, as other tests could take long time
+    DEFAULT_FILTER = {
+        "category": "function",
+        "ignore": False,
+    }
 
     def __init__(self, test_case_path, ci_config_file, case_group=Group):
         self.test_case_path = test_case_path
@@ -131,17 +143,20 @@ class AssignTest(object):
         for job_name in ci_config:
             if self.CI_TEST_JOB_PATTERN.search(job_name) is not None:
                 job_list.append(GitlabCIJob.Job(ci_config[job_name], job_name))
+        job_list.sort(key=lambda x: x["name"])
         return job_list
 
-    @staticmethod
-    def _search_cases(test_case_path, case_filter=None):
+    def _search_cases(self, test_case_path, case_filter=None):
         """
         :param test_case_path: path contains test case folder
-        :param case_filter: filter for test cases
+        :param case_filter: filter for test cases. the filter to use is default filter updated with case_filter param.
         :return: filtered test case list
         """
+        _case_filter = self.DEFAULT_FILTER.copy()
+        if case_filter:
+            _case_filter.update(case_filter)
         test_methods = SearchCases.Search.search_test_cases(test_case_path)
-        return CaseConfig.filter_test_cases(test_methods, case_filter if case_filter else dict())
+        return CaseConfig.filter_test_cases(test_methods, _case_filter)
 
     def _group_cases(self):
         """
@@ -175,6 +190,16 @@ class AssignTest(object):
             bot_filter = dict()
         return bot_filter
 
+    def _apply_bot_test_count(self):
+        """
+        Bot could also pass test count.
+        If filtered cases need to be tested for several times, then we do duplicate them here.
+        """
+        test_count = os.getenv("BOT_TEST_COUNT")
+        if test_count:
+            test_count = int(test_count)
+            self.test_cases *= test_count
+
     def assign_cases(self):
         """
         separate test cases to groups and assign test cases to CI jobs.
@@ -185,6 +210,7 @@ class AssignTest(object):
         failed_to_assign = []
         case_filter = self._apply_bot_filter()
         self.test_cases = self._search_cases(self.test_case_path, case_filter)
+        self._apply_bot_test_count()
         test_groups = self._group_cases()
         for group in test_groups:
             for job in self.jobs:
@@ -193,7 +219,11 @@ class AssignTest(object):
                     break
             else:
                 failed_to_assign.append(group)
-        assert not failed_to_assign
+        if failed_to_assign:
+            console_log("Too many test cases vs jobs to run. Please add the following jobs to .gitlab-ci.yml with specific tags:", "R")
+            for group in failed_to_assign:
+                console_log("* Add job with: " + ",".join(group.ci_job_match_keys), "R")
+            raise RuntimeError("Failed to assign test case to CI jobs")
 
     def output_configs(self, output_path):
         """

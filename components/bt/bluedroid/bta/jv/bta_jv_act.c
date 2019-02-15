@@ -22,29 +22,28 @@
  *
  ******************************************************************************/
 
-#include <arpa/inet.h>
 #include <pthread.h>
 #include <stdlib.h>
 
-#include "allocator.h"
-#include "bt_types.h"
-#include "utl.h"
-#include "bta_sys.h"
-#include "bta_api.h"
-#include "bta_jv_api.h"
+#include "osi/allocator.h"
+#include "stack/bt_types.h"
+#include "bta/utl.h"
+#include "bta/bta_sys.h"
+#include "bta/bta_api.h"
+#include "bta/bta_jv_api.h"
 #include "bta_jv_int.h"
-#include "bta_jv_co.h"
-#include "btm_api.h"
+#include "bta/bta_jv_co.h"
+#include "stack/btm_api.h"
 #include "btm_int.h"
-#include "sdp_api.h"
-#include "l2c_api.h"
-#include "port_api.h"
+#include "stack/sdp_api.h"
+#include "stack/l2c_api.h"
+#include "stack/port_api.h"
 #include <string.h>
-#include "rfcdefs.h"
-#include "avct_api.h"
-#include "avdt_api.h"
-#include "gap_api.h"
-#include "l2c_api.h"
+#include "stack/rfcdefs.h"
+#include "stack/avct_api.h"
+#include "stack/avdt_api.h"
+#include "stack/gap_api.h"
+#include "stack/l2c_api.h"
 
 
 #if (defined BTA_JV_INCLUDED && BTA_JV_INCLUDED == TRUE)
@@ -644,10 +643,17 @@ BOOLEAN bta_jv_check_psm(UINT16 psm)
 *******************************************************************************/
 void bta_jv_enable(tBTA_JV_MSG *p_data)
 {
+    tBTA_UTL_COD   cod;
+
     tBTA_JV_STATUS status = BTA_JV_SUCCESS;
     bta_jv_cb.p_dm_cback = p_data->enable.p_cback;
     bta_jv_cb.p_dm_cback(BTA_JV_ENABLE_EVT, (tBTA_JV *)&status, 0);
     memset(bta_jv_cb.free_psm_list, 0, sizeof(bta_jv_cb.free_psm_list));
+
+    /* Set the Class of Device */
+    cod.major = BTM_COD_MAJOR_UNCLASSIFIED;
+    cod.minor = BTM_COD_MINOR_UNCLASSIFIED;
+    utl_set_device_class(&cod, BTA_UTL_SET_COD_MAJOR_MINOR);
 }
 
 /*******************************************************************************
@@ -663,8 +669,6 @@ void bta_jv_enable(tBTA_JV_MSG *p_data)
 void bta_jv_disable (tBTA_JV_MSG *p_data)
 {
     UNUSED(p_data);
-
-    APPL_TRACE_ERROR("%s", __func__);
 }
 
 
@@ -951,8 +955,16 @@ static bool create_base_record(const uint32_t sdp_handle, const char *name, cons
         proto_list[2].num_params = 0;
     }
 
-    char *stage = "protocol_list";
+    const char *stage = "protocol_list";
     if (!SDP_AddProtocolList(sdp_handle, num_proto_elements, proto_list)){
+        APPL_TRACE_ERROR("create_base_record: failed to create base service "
+                   "record, stage: %s, scn: %d, name: %s, with_obex: %d",
+                   stage, channel, name, with_obex);
+        return FALSE;
+    }
+
+    stage = "profile_descriptor_list";
+    if (!SDP_AddProfileDescriptorList(sdp_handle, UUID_SERVCLASS_SERIAL_PORT, SPP_VERSION)){
         APPL_TRACE_ERROR("create_base_record: failed to create base service "
                    "record, stage: %s, scn: %d, name: %s, with_obex: %d",
                    stage, channel, name, with_obex);
@@ -1000,7 +1012,7 @@ static int add_spp_sdp(const char *name, const int channel) {
     }
 
     // Create the base SDP record.
-    char *stage = "create_base_record";
+    const char *stage = "create_base_record";
     if (!create_base_record(handle, name, channel, FALSE /* with_obex */)){
         SDP_DeleteRecord(handle);
         APPL_TRACE_ERROR("add_spp_sdp: failed to register SPP service, "
@@ -2648,7 +2660,7 @@ void bta_jv_l2cap_connect_le(tBTA_JV_MSG *p_data)
     id = t->id;
     t->init_called = FALSE;
 
-    if (L2CA_ConnectFixedChnl(t->chan, t->remote_addr)) {
+    if (L2CA_ConnectFixedChnl(t->chan, t->remote_addr, BLE_ADDR_UNKNOWN_TYPE)) {
 
         evt.l2c_cl_init.status = BTA_JV_SUCCESS;
         evt.l2c_cl_init.handle = id;

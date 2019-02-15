@@ -27,17 +27,17 @@
 #include <string.h>
 //#include <stdio.h>
 #include <stddef.h>
-#include "bt_trace.h"
-#include "bt_types.h"
+#include "common/bt_trace.h"
+#include "stack/bt_types.h"
 //#include "bt_utils.h"
 #include "btm_int.h"
-#include "btu.h"
-#include "controller.h"
-#include "hci_layer.h"
-#include "hcimsgs.h"
+#include "stack/btu.h"
+#include "device/controller.h"
+#include "hci/hci_layer.h"
+#include "stack/hcimsgs.h"
 #include "l2c_int.h"
 //#include "btcore/include/module.h"
-//#include "osi/include/thread.h"
+//#include "osi/include/osi/thread.h"
 
 #if BLE_INCLUDED == TRUE
 #include "gatt_int.h"
@@ -170,6 +170,9 @@ static void reset_complete(void)
     btm_pm_reset();
 
     l2c_link_processs_num_bufs(controller->get_acl_buffer_count_classic());
+#if BTM_SCO_HCI_INCLUDED == TRUE
+    btm_sco_process_num_bufs(controller->get_sco_buffer_count());
+#endif
 #if (BLE_INCLUDED == TRUE)
 
 #if (defined BLE_PRIVACY_SPT && BLE_PRIVACY_SPT == TRUE)
@@ -686,6 +689,24 @@ tBTM_STATUS BTM_VendorSpecificCommand(UINT16 opcode, UINT8 param_len,
 void btm_vsc_complete (UINT8 *p, UINT16 opcode, UINT16 evt_len,
                        tBTM_CMPL_CB *p_vsc_cplt_cback)
 {
+    tBTM_BLE_CB *ble_cb = &btm_cb.ble_ctr_cb;
+    switch(opcode) {
+        case HCI_VENDOR_BLE_LONG_ADV_DATA:
+            BTM_TRACE_EVENT("Set long adv data complete\n");
+            break;
+        case HCI_VENDOR_BLE_UPDATE_DUPLICATE_EXCEPTIONAL_LIST: {
+            uint8_t subcode, status; uint32_t length;
+            STREAM_TO_UINT8(status, p);
+            STREAM_TO_UINT8(subcode, p);
+            STREAM_TO_UINT32(length, p);
+            if(ble_cb && ble_cb->update_exceptional_list_cmp_cb) {
+                (*ble_cb->update_exceptional_list_cmp_cb)(status, subcode, length, p);
+            }
+            break;
+        }
+        default:
+        break;
+    }
     tBTM_VSC_CMPL   vcs_cplt_params;
 
     /* If there was a callback address for vcs complete, call it */
@@ -804,7 +825,7 @@ tBTM_STATUS BTM_WritePageTimeout(UINT16 timeout)
 ** Function         BTM_WriteVoiceSettings
 **
 ** Description      Send HCI Write Voice Settings command.
-**                  See hcidefs.h for settings bitmask values.
+**                  See stack/hcidefs.h for settings bitmask values.
 **
 ** Returns
 **      BTM_SUCCESS         Command sent.

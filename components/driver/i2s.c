@@ -42,6 +42,7 @@ static const char* I2S_TAG = "I2S";
         ESP_LOGE(I2S_TAG,"%s:%d (%s):%s", __FILE__, __LINE__, __FUNCTION__, str);       \
         return (ret);                                                                   \
         }
+#define I2S_MAX_BUFFER_SIZE (4 * 1024 * 1024) //the maximum RAM can be allocated
 #define I2S_BASE_CLK (2*APB_CLK_FREQ)
 #define I2S_ENTER_CRITICAL_ISR()     portENTER_CRITICAL_ISR(&i2s_spinlock[i2s_num])
 #define I2S_EXIT_CRITICAL_ISR()      portEXIT_CRITICAL_ISR(&i2s_spinlock[i2s_num])
@@ -85,6 +86,7 @@ typedef struct {
     i2s_mode_t mode;            /*!< I2S Working mode*/
     uint32_t sample_rate;              /*!< I2S sample rate */
     bool use_apll;               /*!< I2S use APLL clock */
+    bool tx_desc_auto_clear;    /*!< I2S auto clear tx descriptor on underflow */
     int fixed_mclk;             /*!< I2S fixed MLCK clock */
 } i2s_obj_t;
 
@@ -225,7 +227,7 @@ static float i2s_apll_get_fi2s(int bits_per_sample, int sdm0, int sdm1, int sdm2
  * @param[out]      sdm2             The sdm 2
  * @param[out]      odir             The odir
  *
- * @return     ESP_FAIL or ESP_OK
+ * @return     ESP_ERR_INVALID_ARG or ESP_OK
  */
 
 static esp_err_t i2s_apll_calculate_fi2s(int rate, int bits_per_sample, int *sdm0, int *sdm1, int *sdm2, int *odir)
@@ -234,7 +236,7 @@ static esp_err_t i2s_apll_calculate_fi2s(int rate, int bits_per_sample, int *sdm
     float avg;
     float min_rate, max_rate, min_diff;
     if (rate/bits_per_sample/2/8 < APLL_I2S_MIN_RATE) {
-        return ESP_FAIL;
+        return ESP_ERR_INVALID_ARG;
     }
 
     *sdm0 = 0;
@@ -302,14 +304,14 @@ esp_err_t i2s_set_clk(i2s_port_t i2s_num, uint32_t rate, i2s_bits_per_sample_t b
 
     if (p_i2s_obj[i2s_num] == NULL) {
         ESP_LOGE(I2S_TAG, "Not initialized yet");
-        return ESP_FAIL;
+        return ESP_ERR_INVALID_ARG;
     }
     p_i2s_obj[i2s_num]->sample_rate = rate;
     double clkmdiv = (double)I2S_BASE_CLK / (rate * factor);
 
     if (clkmdiv > 256) {
         ESP_LOGE(I2S_TAG, "clkmdiv is too large\r\n");
-        return ESP_FAIL;
+        return ESP_ERR_INVALID_ARG;
     }
 
     // wait all on-going writing finish
@@ -365,7 +367,7 @@ esp_err_t i2s_set_clk(i2s_port_t i2s_num, uint32_t rate, i2s_bits_per_sample_t b
             if (p_i2s_obj[i2s_num]->tx == NULL) {
                 ESP_LOGE(I2S_TAG, "Failed to create tx dma buffer");
                 i2s_driver_uninstall(i2s_num);
-                return ESP_FAIL;
+                return ESP_ERR_NO_MEM;
             }
             I2S[i2s_num]->out_link.addr = (uint32_t) p_i2s_obj[i2s_num]->tx->desc[0];
 
@@ -383,7 +385,7 @@ esp_err_t i2s_set_clk(i2s_port_t i2s_num, uint32_t rate, i2s_bits_per_sample_t b
             if (p_i2s_obj[i2s_num]->rx == NULL){
                 ESP_LOGE(I2S_TAG, "Failed to create rx dma buffer");
                 i2s_driver_uninstall(i2s_num);
-                return ESP_FAIL;
+                return ESP_ERR_NO_MEM;
             }
             I2S[i2s_num]->rx_eof_num = (p_i2s_obj[i2s_num]->dma_buf_len * p_i2s_obj[i2s_num]->channel_num * p_i2s_obj[i2s_num]->bytes_per_sample)/4;
             I2S[i2s_num]->in_link.addr = (uint32_t) p_i2s_obj[i2s_num]->rx->desc[0];
@@ -486,6 +488,7 @@ static void IRAM_ATTR i2s_intr_handler_default(void *arg)
     lldesc_t *finish_desc;
 
     if (i2s_reg->int_st.out_dscr_err || i2s_reg->int_st.in_dscr_err) {
+        ESP_EARLY_LOGE(I2S_TAG, "dma error, interrupt status: 0x%08x", i2s_reg->int_st.val);
         if (p_i2s->i2s_queue) {
             i2s_event.type = I2S_EVENT_DMA_ERROR;
             if (xQueueIsQueueFullFromISR(p_i2s->i2s_queue)) {
@@ -500,6 +503,12 @@ static void IRAM_ATTR i2s_intr_handler_default(void *arg)
         // All buffers are empty. This means we have an underflow on our hands.
         if (xQueueIsQueueFullFromISR(p_i2s->tx->queue)) {
             xQueueReceiveFromISR(p_i2s->tx->queue, &dummy, &high_priority_task_awoken);
+            // See if tx descriptor needs to be auto cleared:
+            // This will avoid any kind of noise that may get introduced due to transmission
+            // of previous data from tx descriptor on I2S line.
+            if (p_i2s->tx_desc_auto_clear == true) {
+                memset((void *) dummy, 0, p_i2s->tx->buf_size);
+            }
         }
         xQueueSendFromISR(p_i2s->tx->queue, (void*)(&finish_desc->buf), &high_priority_task_awoken);
         if (p_i2s->i2s_queue) {
@@ -539,21 +548,26 @@ static esp_err_t i2s_destroy_dma_queue(i2s_port_t i2s_num, i2s_dma_t *dma)
     int bux_idx;
     if (p_i2s_obj[i2s_num] == NULL) {
         ESP_LOGE(I2S_TAG, "Not initialized yet");
-        return ESP_FAIL;
+        return ESP_ERR_INVALID_ARG;
     }
     if (dma == NULL) {
-        return ESP_FAIL;
+        ESP_LOGE(I2S_TAG, "dma is NULL");
+        return ESP_ERR_INVALID_ARG;
     }
     for (bux_idx = 0; bux_idx < p_i2s_obj[i2s_num]->dma_buf_count; bux_idx++) {
-        if (dma->desc && dma->desc[bux_idx])
+        if (dma->desc && dma->desc[bux_idx]) {
             free(dma->desc[bux_idx]);
-        if (dma->buf && dma->buf[bux_idx])
+        }
+        if (dma->buf && dma->buf[bux_idx]) {
             free(dma->buf[bux_idx]);
+        }
     }
-    if (dma->buf)
+    if (dma->buf) {
         free(dma->buf);
-    if (dma->desc)
+    }
+    if (dma->desc) {
         free(dma->desc);
+    }
     vQueueDelete(dma->queue);
     vSemaphoreDelete(dma->mux);
     free(dma);
@@ -580,14 +594,13 @@ static i2s_dma_t *i2s_create_dma_queue(i2s_port_t i2s_num, int dma_buf_count, in
     memset(dma->buf, 0, sizeof(char*) * dma_buf_count);
 
     for (bux_idx = 0; bux_idx < dma_buf_count; bux_idx++) {
-        dma->buf[bux_idx] = (char*) malloc(dma_buf_len * sample_size);
+        dma->buf[bux_idx] = (char*) heap_caps_calloc(1, dma_buf_len * sample_size, MALLOC_CAP_DMA);
         if (dma->buf[bux_idx] == NULL) {
             ESP_LOGE(I2S_TAG, "Error malloc dma buffer");
             i2s_destroy_dma_queue(i2s_num, dma);
             return NULL;
         }
         ESP_LOGD(I2S_TAG, "Addr[%d] = %d", bux_idx, (int)dma->buf[bux_idx]);
-        memset(dma->buf[bux_idx], 0, dma_buf_len * sample_size);
     }
 
     dma->desc = (lldesc_t**) malloc(sizeof(lldesc_t*) * dma_buf_count);
@@ -597,7 +610,7 @@ static i2s_dma_t *i2s_create_dma_queue(i2s_port_t i2s_num, int dma_buf_count, in
         return NULL;
     }
     for (bux_idx = 0; bux_idx < dma_buf_count; bux_idx++) {
-        dma->desc[bux_idx] = (lldesc_t*) malloc(sizeof(lldesc_t));
+        dma->desc[bux_idx] = (lldesc_t*) heap_caps_malloc(sizeof(lldesc_t), MALLOC_CAP_DMA);
         if (dma->desc[bux_idx] == NULL) {
             ESP_LOGE(I2S_TAG, "Error malloc dma description entry");
             i2s_destroy_dma_queue(i2s_num, dma);
@@ -627,6 +640,7 @@ static i2s_dma_t *i2s_create_dma_queue(i2s_port_t i2s_num, int dma_buf_count, in
 
 esp_err_t i2s_start(i2s_port_t i2s_num)
 {
+    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
     //start DMA link
     I2S_ENTER_CRITICAL();
     i2s_reset_fifo(i2s_num);
@@ -660,6 +674,7 @@ esp_err_t i2s_start(i2s_port_t i2s_num)
 
 esp_err_t i2s_stop(i2s_port_t i2s_num)
 {
+    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
     I2S_ENTER_CRITICAL();
     esp_intr_disable(p_i2s_obj[i2s_num]->i2s_isr_handle);
     if (p_i2s_obj[i2s_num]->mode & I2S_MODE_TX) {
@@ -674,7 +689,7 @@ esp_err_t i2s_stop(i2s_port_t i2s_num)
     }
     I2S[i2s_num]->int_clr.val = I2S[i2s_num]->int_st.val; //clear pending interrupt
     I2S_EXIT_CRITICAL();
-    return 0;
+    return ESP_OK;
 }
 
 esp_err_t i2s_set_dac_mode(i2s_dac_mode_t dac_mode)
@@ -983,6 +998,7 @@ static esp_err_t i2s_param_config(i2s_port_t i2s_num, const i2s_config_t *i2s_co
     }
 
     p_i2s_obj[i2s_num]->use_apll = i2s_config->use_apll;
+    p_i2s_obj[i2s_num]->tx_desc_auto_clear = i2s_config->tx_desc_auto_clear;
     p_i2s_obj[i2s_num]->fixed_mclk = i2s_config->fixed_mclk;
     return ESP_OK;
 }
@@ -996,6 +1012,12 @@ esp_err_t i2s_zero_dma_buffer(i2s_port_t i2s_num)
         }
     }
     if (p_i2s_obj[i2s_num]->tx && p_i2s_obj[i2s_num]->tx->buf != NULL && p_i2s_obj[i2s_num]->tx->buf_size != 0) {
+        int bytes_left = 0;
+        bytes_left = (p_i2s_obj[i2s_num]->tx->buf_size - p_i2s_obj[i2s_num]->tx->rw_pos) % 4;
+        if (bytes_left) {
+            size_t zero_bytes = 0, bytes_written;
+            i2s_write(i2s_num, (void *)&zero_bytes, bytes_left, &bytes_written, portMAX_DELAY);
+        }
         for (int i = 0; i < p_i2s_obj[i2s_num]->dma_buf_count; i++) {
             memset(p_i2s_obj[i2s_num]->tx->buf[i], 0, p_i2s_obj[i2s_num]->tx->buf_size);
         }
@@ -1014,7 +1036,7 @@ esp_err_t i2s_driver_install(i2s_port_t i2s_num, const i2s_config_t *i2s_config,
         p_i2s_obj[i2s_num] = (i2s_obj_t*) malloc(sizeof(i2s_obj_t));
         if (p_i2s_obj[i2s_num] == NULL) {
             ESP_LOGE(I2S_TAG, "Malloc I2S driver error");
-            return ESP_FAIL;
+            return ESP_ERR_NO_MEM;
         }
         memset(p_i2s_obj[i2s_num], 0, sizeof(i2s_obj_t));
 
@@ -1062,15 +1084,15 @@ esp_err_t i2s_driver_install(i2s_port_t i2s_num, const i2s_config_t *i2s_config,
         return i2s_set_clk(i2s_num, i2s_config->sample_rate, i2s_config->bits_per_sample, p_i2s_obj[i2s_num]->channel_num);
     }
 
-    ESP_LOGE(I2S_TAG, "I2S driver already installed");
-    return ESP_ERR_INVALID_STATE;
+    ESP_LOGW(I2S_TAG, "I2S driver already installed");
+    return ESP_OK;
 }
 
 esp_err_t i2s_driver_uninstall(i2s_port_t i2s_num)
 {
     I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
     if (p_i2s_obj[i2s_num] == NULL) {
-        ESP_LOGI(I2S_TAG, "ALREADY NULL");
+        ESP_LOGI(I2S_TAG, "already uninstalled");
         return ESP_OK;
     }
     i2s_stop(i2s_num);
@@ -1105,15 +1127,28 @@ esp_err_t i2s_driver_uninstall(i2s_port_t i2s_num)
     return ESP_OK;
 }
 
-int i2s_write_bytes(i2s_port_t i2s_num, const char *src, size_t size, TickType_t ticks_to_wait)
+int i2s_write_bytes(i2s_port_t i2s_num, const void *src, size_t size, TickType_t ticks_to_wait)
 {
-    char *data_ptr;
-    int bytes_can_write, bytes_writen = 0;
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
-    if (p_i2s_obj[i2s_num]->tx == NULL) {
-        return 0;
+    size_t bytes_written = 0;
+    int res = 0;
+    res = i2s_write(i2s_num, src, size, &bytes_written, ticks_to_wait);
+    if (res != ESP_OK) {
+        return ESP_FAIL;
+    } else {
+        return bytes_written;
     }
+}
+
+esp_err_t i2s_write(i2s_port_t i2s_num, const void *src, size_t size, size_t *bytes_written, TickType_t ticks_to_wait)
+{
+    char *data_ptr, *src_byte;
+    int bytes_can_write;
+    *bytes_written = 0;
+    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK((size < I2S_MAX_BUFFER_SIZE), "size is too large", ESP_ERR_INVALID_ARG);
+    I2S_CHECK((p_i2s_obj[i2s_num]->tx), "tx NULL", ESP_ERR_INVALID_ARG);
     xSemaphoreTake(p_i2s_obj[i2s_num]->tx->mux, (portTickType)portMAX_DELAY);
+    src_byte = (char *)src;
     while (size > 0) {
         if (p_i2s_obj[i2s_num]->tx->rw_pos == p_i2s_obj[i2s_num]->tx->buf_size || p_i2s_obj[i2s_num]->tx->curr_ptr == NULL) {
             if (xQueueReceive(p_i2s_obj[i2s_num]->tx->queue, &p_i2s_obj[i2s_num]->tx->curr_ptr, ticks_to_wait) == pdFALSE) {
@@ -1128,14 +1163,14 @@ int i2s_write_bytes(i2s_port_t i2s_num, const char *src, size_t size, TickType_t
         if (bytes_can_write > size) {
             bytes_can_write = size;
         }
-        memcpy(data_ptr, src, bytes_can_write);
+        memcpy(data_ptr, src_byte, bytes_can_write);
         size -= bytes_can_write;
-        src += bytes_can_write;
+        src_byte += bytes_can_write;
         p_i2s_obj[i2s_num]->tx->rw_pos += bytes_can_write;
-        bytes_writen += bytes_can_write;
+        (*bytes_written) += bytes_can_write;
     }
     xSemaphoreGive(p_i2s_obj[i2s_num]->tx->mux);
-    return bytes_writen;
+    return ESP_OK;
 }
 
 esp_err_t i2s_adc_enable(i2s_port_t i2s_num)
@@ -1159,14 +1194,90 @@ esp_err_t i2s_adc_disable(i2s_port_t i2s_num)
     return ESP_OK;
 }
 
-int i2s_read_bytes(i2s_port_t i2s_num, char* dest, size_t size, TickType_t ticks_to_wait)
+esp_err_t i2s_write_expand(i2s_port_t i2s_num, const void *src, size_t size, size_t src_bits, size_t aim_bits, size_t *bytes_written, TickType_t ticks_to_wait)
 {
     char *data_ptr;
-    int bytes_can_read, byte_read = 0;
+    int bytes_can_write, tail;
+    int src_bytes, aim_bytes, zero_bytes;
+    *bytes_written = 0;
     I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
-    if (p_i2s_obj[i2s_num]->rx == NULL) {
-        return 0;
+    I2S_CHECK((size > 0), "size must greater than zero", ESP_ERR_INVALID_ARG);
+    I2S_CHECK((aim_bits * size < I2S_MAX_BUFFER_SIZE), "size is too large", ESP_ERR_INVALID_ARG);
+    I2S_CHECK((aim_bits >= src_bits), "aim_bits musn't less than src_bits", ESP_ERR_INVALID_ARG);
+    I2S_CHECK((p_i2s_obj[i2s_num]->tx), "tx NULL", ESP_ERR_INVALID_ARG);
+    if (src_bits < I2S_BITS_PER_SAMPLE_8BIT || aim_bits < I2S_BITS_PER_SAMPLE_8BIT) {
+        ESP_LOGE(I2S_TAG,"bits musn't be less than 8, src_bits %d aim_bits %d", src_bits, aim_bits);
+        return ESP_ERR_INVALID_ARG;
     }
+    if (src_bits > I2S_BITS_PER_SAMPLE_32BIT || aim_bits > I2S_BITS_PER_SAMPLE_32BIT) {
+        ESP_LOGE(I2S_TAG,"bits musn't be greater than 32, src_bits %d aim_bits %d", src_bits, aim_bits);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if ((src_bits == I2S_BITS_PER_SAMPLE_16BIT || src_bits == I2S_BITS_PER_SAMPLE_32BIT) && (size % 2 != 0)) {
+        ESP_LOGE(I2S_TAG,"size must be a even number while src_bits is even, src_bits %d size %d", src_bits, size);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (src_bits == I2S_BITS_PER_SAMPLE_24BIT && (size % 3 != 0)) {
+        ESP_LOGE(I2S_TAG,"size must be a multiple of 3 while src_bits is 24, size %d", size);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    src_bytes = src_bits / 8;
+    aim_bytes = aim_bits / 8;
+    zero_bytes = aim_bytes - src_bytes;
+    xSemaphoreTake(p_i2s_obj[i2s_num]->tx->mux, (portTickType)portMAX_DELAY);
+    size = size * aim_bytes / src_bytes;
+    ESP_LOGD(I2S_TAG,"aim_bytes %d src_bytes %d size %d", aim_bytes, src_bytes, size);
+    while (size > 0) {
+        if (p_i2s_obj[i2s_num]->tx->rw_pos == p_i2s_obj[i2s_num]->tx->buf_size || p_i2s_obj[i2s_num]->tx->curr_ptr == NULL) {
+            if (xQueueReceive(p_i2s_obj[i2s_num]->tx->queue, &p_i2s_obj[i2s_num]->tx->curr_ptr, ticks_to_wait) == pdFALSE) {
+                break;
+            }
+            p_i2s_obj[i2s_num]->tx->rw_pos = 0;
+        }
+        data_ptr = (char*)p_i2s_obj[i2s_num]->tx->curr_ptr;
+        data_ptr += p_i2s_obj[i2s_num]->tx->rw_pos;
+        bytes_can_write = p_i2s_obj[i2s_num]->tx->buf_size - p_i2s_obj[i2s_num]->tx->rw_pos;
+        if (bytes_can_write > size) {
+            bytes_can_write = size;
+        }
+        tail = bytes_can_write % aim_bytes;
+        bytes_can_write = bytes_can_write - tail;
+
+        memset(data_ptr, 0, bytes_can_write);
+        for (int j = 0; j < bytes_can_write; j += (aim_bytes - zero_bytes)) {
+            j += zero_bytes;
+            memcpy(&data_ptr[j], (const char *)(src + *bytes_written), aim_bytes - zero_bytes);
+            (*bytes_written) += (aim_bytes - zero_bytes);
+        }
+        size -= bytes_can_write;
+        p_i2s_obj[i2s_num]->tx->rw_pos += bytes_can_write;
+    }
+    xSemaphoreGive(p_i2s_obj[i2s_num]->tx->mux);
+    return ESP_OK;
+}
+
+int i2s_read_bytes(i2s_port_t i2s_num, void *dest, size_t size, TickType_t ticks_to_wait)
+{
+    size_t bytes_read = 0;
+    int res = 0;
+    res = i2s_read(i2s_num, dest, size, &bytes_read, ticks_to_wait);
+    if (res != ESP_OK) {
+        return ESP_FAIL;
+    } else {
+        return bytes_read;
+    }
+}
+
+esp_err_t i2s_read(i2s_port_t i2s_num, void *dest, size_t size, size_t *bytes_read, TickType_t ticks_to_wait)
+{
+    char *data_ptr, *dest_byte;
+    int bytes_can_read;
+    *bytes_read = 0;
+    dest_byte = (char *)dest;
+    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
+    I2S_CHECK((size < I2S_MAX_BUFFER_SIZE), "size is too large", ESP_ERR_INVALID_ARG);
+    I2S_CHECK((p_i2s_obj[i2s_num]->rx), "rx NULL", ESP_ERR_INVALID_ARG);
     xSemaphoreTake(p_i2s_obj[i2s_num]->rx->mux, (portTickType)portMAX_DELAY);
     while (size > 0) {
         if (p_i2s_obj[i2s_num]->rx->rw_pos == p_i2s_obj[i2s_num]->rx->buf_size || p_i2s_obj[i2s_num]->rx->curr_ptr == NULL) {
@@ -1181,61 +1292,40 @@ int i2s_read_bytes(i2s_port_t i2s_num, char* dest, size_t size, TickType_t ticks
         if (bytes_can_read > size) {
             bytes_can_read = size;
         }
-        memcpy(dest, data_ptr, bytes_can_read);
+        memcpy(dest_byte, data_ptr, bytes_can_read);
         size -= bytes_can_read;
-        dest += bytes_can_read;
+        dest_byte += bytes_can_read;
         p_i2s_obj[i2s_num]->rx->rw_pos += bytes_can_read;
-        byte_read += bytes_can_read;
+        (*bytes_read) += bytes_can_read;
     }
     xSemaphoreGive(p_i2s_obj[i2s_num]->rx->mux);
-    return byte_read;
-}
-int i2s_push_sample(i2s_port_t i2s_num, const char *sample, TickType_t ticks_to_wait)
-{
-    int i, bytes_to_push = 0;
-    char *data_ptr;
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
-    if (p_i2s_obj[i2s_num]->tx->rw_pos == p_i2s_obj[i2s_num]->tx->buf_size || p_i2s_obj[i2s_num]->tx->curr_ptr == NULL) {
-        if (xQueueReceive(p_i2s_obj[i2s_num]->tx->queue, &p_i2s_obj[i2s_num]->tx->curr_ptr, ticks_to_wait) == pdFALSE) {
-            return 0;
-        }
-        ESP_LOGD(I2S_TAG, "rw_pos: %d, buf_size: %d, curr_ptr: %d", p_i2s_obj[i2s_num]->tx->rw_pos, p_i2s_obj[i2s_num]->tx->buf_size, (int)p_i2s_obj[i2s_num]->tx->curr_ptr);
-        p_i2s_obj[i2s_num]->tx->rw_pos = 0;
-    }
-    data_ptr = (char*)p_i2s_obj[i2s_num]->tx->curr_ptr;
-    data_ptr += p_i2s_obj[i2s_num]->tx->rw_pos;
-    for (i = 0; i < p_i2s_obj[i2s_num]->bytes_per_sample * p_i2s_obj[i2s_num]->channel_num; i++) {
-        *data_ptr++ = *sample++;
-        bytes_to_push ++;
-    }
-    p_i2s_obj[i2s_num]->tx->rw_pos += bytes_to_push;
-    return bytes_to_push;
+    return ESP_OK;
 }
 
-int i2s_pop_sample(i2s_port_t i2s_num, char *sample, TickType_t ticks_to_wait)
+int i2s_push_sample(i2s_port_t i2s_num, const void *sample, TickType_t ticks_to_wait)
 {
-    int  i, bytes_to_pop = 0;
-    char *data_ptr;
-    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_ERR_INVALID_ARG);
-    if (p_i2s_obj[i2s_num]->rx->rw_pos == p_i2s_obj[i2s_num]->rx->buf_size || p_i2s_obj[i2s_num]->rx->curr_ptr == NULL) {
-        if (xQueueReceive(p_i2s_obj[i2s_num]->rx->queue, &p_i2s_obj[i2s_num]->rx->curr_ptr, ticks_to_wait) == pdFALSE) {
-            return 0;
-        }
-        p_i2s_obj[i2s_num]->rx->rw_pos = 0;
+    size_t bytes_push = 0;
+    int res = 0;
+    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_FAIL);
+    res = i2s_write(i2s_num, sample, p_i2s_obj[i2s_num]->bytes_per_sample, &bytes_push, ticks_to_wait);
+    if (res != ESP_OK) {
+        return ESP_FAIL;
+    } else {
+        return bytes_push;
     }
-    data_ptr = (char*)p_i2s_obj[i2s_num]->rx->curr_ptr;
-    data_ptr += p_i2s_obj[i2s_num]->rx->rw_pos;
-    for (i = 0; i < p_i2s_obj[i2s_num]->bytes_per_sample; i++) {
-        *sample++ = *data_ptr++;
-        bytes_to_pop++;
-    }
-    if (p_i2s_obj[i2s_num]->channel_num == 2) {
-        for (i = 0; i < p_i2s_obj[i2s_num]->bytes_per_sample; i++) {
-            *sample++ = *data_ptr++;
-            bytes_to_pop++;
-        }
-    }
-
-    p_i2s_obj[i2s_num]->rx->rw_pos += p_i2s_obj[i2s_num]->bytes_per_sample * p_i2s_obj[i2s_num]->channel_num;
-    return bytes_to_pop;
 }
+
+int i2s_pop_sample(i2s_port_t i2s_num, void *sample, TickType_t ticks_to_wait)
+{
+    size_t bytes_pop = 0;
+    int res = 0;
+    I2S_CHECK((i2s_num < I2S_NUM_MAX), "i2s_num error", ESP_FAIL);
+    res = i2s_read(i2s_num, sample, p_i2s_obj[i2s_num]->bytes_per_sample, &bytes_pop, ticks_to_wait);
+    if (res != ESP_OK) {
+        return ESP_FAIL;
+    } else {
+        return bytes_pop;
+    }
+}
+
+

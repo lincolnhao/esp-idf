@@ -1,17 +1,28 @@
-*************************
-Setup OpenOCD for Windows
-*************************
+**************************
+Set up OpenOCD for Windows
+**************************
+
+IDF Tools Installer
+===================
+
+If you are using CMake build system and followed the :doc:`/get-started-cmake/windows-setup` with the ``ESP-IDF Tools Installer`` V1.2 or newer, then by default you will already have ``openocd`` installed.
+
+``ESP-IDF Tools Installer`` adds ``openocd` to the ``PATH`` so that it can be run from any directory.
+
+Set up OpenOCD
+==============
 
 
-Setup OpenOCD
-=============
+OpenOCD for Windows is available for download from Github:
 
-OpenOCD for Windows / MSYS2 is available for download from Espressif website:
+https://github.com/espressif/openocd-esp32/releases
 
-https://dl.espressif.com/dl/openocd-esp32-win32-a859564.zip
+Download latest release archive with `win32` in its name, for example `openocd-esp32-macos-0.10.0-win32-20180418.zip`.
 
-Download this file and extract ``openocd-esp32`` folder inside to ``~/esp/`` directory.
+Extract the downloaded file in ``~/esp/`` directory.
 
+    cd ~/esp
+    unzip /c/Users/<user>/Downloads/openocd-esp32-win32-<version>.zip
 
 Next Steps
 ==========

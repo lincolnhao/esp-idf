@@ -54,6 +54,7 @@
 #define LEDC_OUTPUT_IO      18 // Output GPIO of a sample 1 Hz pulse generator
 
 xQueueHandle pcnt_evt_queue;   // A queue to handle pulse counter events
+pcnt_isr_handle_t user_isr_handle = NULL; //user's ISR service handle
 
 /* A sample structure to pass events from the PCNT
  * interrupt handler to the main program.
@@ -110,6 +111,7 @@ static void ledc_init(void)
     ledc_channel.intr_type  = LEDC_INTR_DISABLE;
     ledc_channel.gpio_num   = LEDC_OUTPUT_IO;
     ledc_channel.duty       = 100; // set duty at about 10%
+    ledc_channel.hpoint     = 0;
     ledc_channel_config(&ledc_channel);
 }
 
@@ -159,7 +161,7 @@ static void pcnt_example_init(void)
     pcnt_counter_clear(PCNT_TEST_UNIT);
 
     /* Register ISR handler and enable interrupts for PCNT unit */
-    pcnt_isr_register(pcnt_example_intr_handler, NULL, 0, NULL);
+    pcnt_isr_register(pcnt_example_intr_handler, NULL, 0, &user_isr_handle);
     pcnt_intr_enable(PCNT_TEST_UNIT);
 
     /* Everything is set up, now go to counting */
@@ -205,5 +207,10 @@ void app_main()
             pcnt_get_counter_value(PCNT_TEST_UNIT, &count);
             printf("Current counter value :%d\n", count);
         }
+    }
+    if(user_isr_handle) {
+        //Free the ISR service handle.
+        esp_intr_free(user_isr_handle);
+        user_isr_handle = NULL;
     }
 }

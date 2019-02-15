@@ -11,25 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 #include "mdns.h"
-
-#include <string.h>
-#include "sdkconfig.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "lwip/ip_addr.h"
-#include "lwip/pbuf.h"
-#include "lwip/igmp.h"
-#include "lwip/udp.h"
-#include "lwip/mld6.h"
-#include "lwip/priv/tcpip_priv.h"
-#include "esp_wifi.h"
-#include "esp_system.h"
-#include "esp_timer.h"
-#include "esp_event_loop.h"
-
 #include "mdns_private.h"
+#include "mdns_networking.h"
+#include "esp_log.h"
+#include <string.h>
 
 #ifdef MDNS_ENABLE_DEBUG
 void mdns_debug_packet(const uint8_t * data, size_t len);
@@ -38,7 +25,9 @@ void mdns_debug_packet(const uint8_t * data, size_t len);
 static const char * MDNS_DEFAULT_DOMAIN = "local";
 static const char * MDNS_SUB_STR = "_sub";
 
-static mdns_server_t * _mdns_server = NULL;
+mdns_server_t * _mdns_server = NULL;
+
+static const char *TAG = "MDNS";
 
 static volatile TaskHandle_t _mdns_service_task_handle = NULL;
 static SemaphoreHandle_t _mdns_service_semaphore = NULL;
@@ -49,6 +38,10 @@ static void _mdns_search_result_add_ip(mdns_search_once_t * search, const char *
 static void _mdns_search_result_add_srv(mdns_search_once_t * search, const char * hostname, uint16_t port, tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t ip_protocol);
 static void _mdns_search_result_add_txt(mdns_search_once_t * search, mdns_txt_item_t * txt, size_t txt_count, tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t ip_protocol);
 static mdns_result_t * _mdns_search_result_add_ptr(mdns_search_once_t * search, const char * instance, tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t ip_protocol);
+
+static inline bool _str_null_or_empty(const char * str){
+    return (str == NULL || *str == 0);
+}
 
 /*
  * @brief  Appends/increments a number to name/instance in case of collision
@@ -73,11 +66,16 @@ static char * _mdns_mangle_name(char* in) {
         //need to add -2 to string
         ret = malloc(strlen(in) + 3);
         if (ret == NULL) {
+            HOOK_MALLOC_FAILED;
             return NULL;
         }
         sprintf(ret, "%s-2", in);
     } else {
         ret = malloc(strlen(in) + 2); //one extra byte in case 9-10 or 99-100 etc
+        if (ret == NULL) {
+            HOOK_MALLOC_FAILED;
+            return NULL;
+        }
         strcpy(ret, in);
         int baseLen = p - in; //length of 'bla' in 'bla-123'
         //overwrite suffix with new suffix
@@ -106,19 +104,28 @@ static mdns_srv_item_t * _mdns_get_service_item(const char * service, const char
     return NULL;
 }
 
-/*
- * MDNS Server Networking
- * */
+static bool _mdns_can_add_more_services(void)
+{
+    mdns_srv_item_t * s = _mdns_server->services;
+    uint16_t service_num = 0;
+    while (s) {
+        service_num ++;
+        s = s->next;
+        if (service_num >= MDNS_MAX_SERVICES) {
+            return false;
+        }
+    }
 
-/**
- * @brief  Queue RX packet action
- */
-static esp_err_t _mdns_send_rx_action(mdns_rx_packet_t * packet)
+    return true;
+}
+
+esp_err_t _mdns_send_rx_action(mdns_rx_packet_t * packet)
 {
     mdns_action_t * action = NULL;
 
     action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
+        HOOK_MALLOC_FAILED;
         return ESP_ERR_NO_MEM;
     }
 
@@ -132,283 +139,23 @@ static esp_err_t _mdns_send_rx_action(mdns_rx_packet_t * packet)
 }
 
 /**
- * @brief  the receive callback of the raw udp api. Packets are received here
- *
+ * @brief  Get the service name of a service
  */
-static void _udp_recv(void *arg, struct udp_pcb *upcb, struct pbuf *pb, const ip_addr_t *raddr, uint16_t rport)
+static const char * _mdns_get_service_instance_name(mdns_service_t * service)
 {
-    uint8_t i;
-    while (pb != NULL) {
-        struct pbuf * this_pb = pb;
-        pb = pb->next;
-        this_pb->next = NULL;
-
-        mdns_rx_packet_t * packet = (mdns_rx_packet_t *)malloc(sizeof(mdns_rx_packet_t));
-        if (!packet) {
-            //missed packet - no memory
-            pbuf_free(this_pb);
-            continue;
-        }
-
-        packet->tcpip_if = TCPIP_ADAPTER_IF_MAX;
-        packet->pb = this_pb;
-        packet->src_port = rport;
-        memcpy(&packet->src, raddr, sizeof(ip_addr_t));
-        packet->dest.type = packet->src.type;
-
-        if (packet->src.type == IPADDR_TYPE_V4) {
-            packet->ip_protocol = MDNS_IP_PROTOCOL_V4;
-            struct ip_hdr * iphdr = (struct ip_hdr *)(((uint8_t *)(packet->pb->payload)) - UDP_HLEN - IP_HLEN);
-            packet->dest.u_addr.ip4.addr = iphdr->dest.addr;
-        } else {
-            packet->ip_protocol = MDNS_IP_PROTOCOL_V6;
-            struct ip6_hdr * ip6hdr = (struct ip6_hdr *)(((uint8_t *)(packet->pb->payload)) - UDP_HLEN - IP6_HLEN);
-            memcpy(&packet->dest.u_addr.ip6.addr, (uint8_t *)ip6hdr->dest.addr, 16);
-        }
-        packet->multicast = ip_addr_ismulticast(&(packet->dest));
-
-        //lwip does not return the proper pcb if you have more than one for the same multicast address (but different interfaces)
-        struct netif * netif = NULL;
-        void * nif = NULL;
-        struct udp_pcb * pcb = NULL;
-        for (i=0; i<TCPIP_ADAPTER_IF_MAX; i++) {
-            pcb = _mdns_server->interfaces[i].pcbs[packet->ip_protocol].pcb;
-            tcpip_adapter_get_netif (i, &nif);
-            netif = (struct netif *)nif;
-            if (pcb && netif && netif == ip_current_input_netif ()) {
-                if (packet->src.type == IPADDR_TYPE_V4) {
-                    if ((packet->src.u_addr.ip4.addr & netif->netmask.u_addr.ip4.addr) != (netif->ip_addr.u_addr.ip4.addr & netif->netmask.u_addr.ip4.addr)) {
-                        //packet source is not in the same subnet
-                        pcb = NULL;
-                        break;
-                    }
-                }
-                packet->tcpip_if = i;
-                break;
-            }
-            pcb = NULL;
-        }
-
-        if (!pcb || !_mdns_server || !_mdns_server->action_queue
-          || _mdns_send_rx_action(packet) != ESP_OK) {
-            pbuf_free(this_pb);
-            free(packet);
-        }
-    }
-}
-
-/**
- * @brief  Stop PCB Main code
- */
-static void _udp_pcb_deinit(tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t ip_protocol)
-{
-    if (!_mdns_server) {
-        return;
-    }
-    mdns_pcb_t * _pcb = &_mdns_server->interfaces[tcpip_if].pcbs[ip_protocol];
-    if (_pcb->pcb) {
-        _pcb->state = PCB_OFF;
-        udp_recv(_pcb->pcb, NULL, NULL);
-        udp_disconnect(_pcb->pcb);
-        udp_remove(_pcb->pcb);
-        free(_pcb->probe_services);
-        _pcb->pcb = NULL;
-        _pcb->probe_ip = false;
-        _pcb->probe_services = NULL;
-        _pcb->probe_services_len = 0;
-        _pcb->probe_running = false;
-        _pcb->failed_probes = 0;
-    }
-}
-
-/**
- * @brief  Start PCB V4
- */
-static esp_err_t _udp_pcb_v4_init(tcpip_adapter_if_t tcpip_if)
-{
-    tcpip_adapter_ip_info_t if_ip_info;
-
-    if (!_mdns_server || _mdns_server->interfaces[tcpip_if].pcbs[MDNS_IP_PROTOCOL_V4].pcb) {
-        return ESP_ERR_INVALID_STATE;
+    if (service && !_str_null_or_empty(service->instance)) {
+        return service->instance;
     }
 
-    if (tcpip_adapter_get_ip_info(tcpip_if, &if_ip_info) || if_ip_info.ip.addr == 0) {
-        return ESP_ERR_INVALID_ARG;
+    if (_mdns_server && !_str_null_or_empty(_mdns_server->instance)) {
+        return _mdns_server->instance;
     }
 
-    ip_addr_t interface_addr = IPADDR4_INIT(if_ip_info.ip.addr);
-
-    ip_addr_t multicast_addr;
-    IP_ADDR4(&multicast_addr, 224, 0, 0, 251);
-
-    if (igmp_joingroup((const struct ip4_addr *)&interface_addr.u_addr.ip4, (const struct ip4_addr *)&multicast_addr.u_addr.ip4)) {
-        return ESP_ERR_INVALID_STATE;
+    if (_mdns_server && !_str_null_or_empty(_mdns_server->hostname)) {
+        return _mdns_server->hostname;
     }
 
-    struct udp_pcb * pcb = udp_new_ip_type(IPADDR_TYPE_V4);
-    if (!pcb) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    if (udp_bind(pcb, &interface_addr, MDNS_SERVICE_PORT) != 0) {
-        udp_remove(pcb);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    pcb->mcast_ttl = 1;
-    pcb->remote_port = MDNS_SERVICE_PORT;
-    ip_addr_copy(pcb->multicast_ip, interface_addr);
-    ip_addr_copy(pcb->remote_ip, multicast_addr);
-
-    _mdns_server->interfaces[tcpip_if].pcbs[MDNS_IP_PROTOCOL_V4].pcb = pcb;
-    _mdns_server->interfaces[tcpip_if].pcbs[MDNS_IP_PROTOCOL_V4].failed_probes = 0;
-    udp_recv(pcb, &_udp_recv, _mdns_server);
-
-    return ESP_OK;
-}
-
-/**
- * @brief  Start PCB V6
- */
-static esp_err_t _udp_pcb_v6_init(tcpip_adapter_if_t tcpip_if)
-{
-    ip_addr_t multicast_addr = IPADDR6_INIT(0x000002ff, 0, 0, 0xfb000000);
-    ip_addr_t interface_addr;
-    interface_addr.type = IPADDR_TYPE_V6;
-
-    if (!_mdns_server || _mdns_server->interfaces[tcpip_if].pcbs[MDNS_IP_PROTOCOL_V6].pcb) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (tcpip_adapter_get_ip6_linklocal(tcpip_if, &interface_addr.u_addr.ip6)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (mld6_joingroup(&(interface_addr.u_addr.ip6), &(multicast_addr.u_addr.ip6))) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    struct udp_pcb * pcb = udp_new_ip_type(IPADDR_TYPE_V6);
-    if (!pcb) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    if (udp_bind(pcb, &interface_addr, MDNS_SERVICE_PORT) != 0) {
-        udp_remove(pcb);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    pcb->remote_port = MDNS_SERVICE_PORT;
-    ip_addr_copy(pcb->remote_ip, multicast_addr);
-
-    _mdns_server->interfaces[tcpip_if].pcbs[MDNS_IP_PROTOCOL_V6].pcb = pcb;
-    _mdns_server->interfaces[tcpip_if].pcbs[MDNS_IP_PROTOCOL_V6].failed_probes = 0;
-    udp_recv(pcb, &_udp_recv, _mdns_server);
-
-    return ESP_OK;
-}
-
-/**
- * @brief  Start PCB Main code
- */
-static esp_err_t _udp_pcb_init(tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t ip_protocol)
-{
-    if (ip_protocol == MDNS_IP_PROTOCOL_V4) {
-        return _udp_pcb_v4_init(tcpip_if);
-    } else if (ip_protocol == MDNS_IP_PROTOCOL_V6) {
-        return _udp_pcb_v6_init(tcpip_if);
-    }
-    return ESP_ERR_INVALID_ARG;
-}
-
-typedef struct {
-    struct tcpip_api_call call;
-    tcpip_adapter_if_t tcpip_if;
-    mdns_ip_protocol_t ip_protocol;
-    esp_err_t err;
-} mdns_api_call_t;
-
-/**
- * @brief  Start PCB from LwIP thread
- */
-static err_t _mdns_pcb_init_api(struct tcpip_api_call *api_call_msg)
-{
-    mdns_api_call_t * msg = (mdns_api_call_t *)api_call_msg;
-    msg->err = _udp_pcb_init(msg->tcpip_if, msg->ip_protocol);
-    return msg->err;
-}
-
-/**
- * @brief  Start PCB
- */
-static esp_err_t _mdns_pcb_init(tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t ip_protocol)
-{
-    mdns_api_call_t msg = {
-        .tcpip_if = tcpip_if,
-        .ip_protocol = ip_protocol
-    };
-    tcpip_api_call(_mdns_pcb_init_api, (struct tcpip_api_call*)&msg);
-    return msg.err;
-}
-
-/**
- * @brief  Stop PCB from LwIP thread
- */
-static err_t _mdns_pcb_deinit_api(struct tcpip_api_call *api_call_msg)
-{
-    mdns_api_call_t * msg = (mdns_api_call_t *)api_call_msg;
-    _udp_pcb_deinit(msg->tcpip_if, msg->ip_protocol);
-    msg->err = ESP_OK;
-    return ESP_OK;
-}
-
-/**
- * @brief  Stop PCB
- */
-static esp_err_t _mdns_pcb_deinit(tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t ip_protocol)
-{
-    mdns_api_call_t msg = {
-        .tcpip_if = tcpip_if,
-        .ip_protocol = ip_protocol
-    };
-    tcpip_api_call(_mdns_pcb_deinit_api, (struct tcpip_api_call*)&msg);
-    return msg.err;
-}
-
-
-/**
- * @brief  send packet over UDP
- *
- * @param  server       The server
- * @param  data         byte array containing the packet data
- * @param  len          length of the packet data
- *
- * @return length of sent packet or 0 on error
- */
-static size_t _udp_pcb_write(tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t ip_protocol, const ip_addr_t *ip, uint16_t port, uint8_t * data, size_t len)
-{
-#ifndef MDNS_TEST_MODE
-    struct netif * netif = NULL;
-    void * nif = NULL;
-    esp_err_t err = tcpip_adapter_get_netif(tcpip_if, &nif);
-    netif = (struct netif *)nif;
-    if (err) {
-        return 0;
-    }
-
-    struct pbuf* pbt = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
-    if (pbt == NULL) {
-        return 0;
-    }
-    memcpy((uint8_t *)pbt->payload, data, len);
-
-    err = udp_sendto_if (_mdns_server->interfaces[tcpip_if].pcbs[ip_protocol].pcb, pbt, ip, port, netif);
-    pbuf_free(pbt);
-    if (err) {
-        return 0;
-    }
-#endif
-    return len;
+    return NULL;
 }
 
 /**
@@ -783,12 +530,14 @@ static uint16_t _mdns_append_txt_record(uint8_t * packet, uint16_t * index, mdns
     uint16_t record_length = 0;
     uint8_t part_length;
 
-    str[0] = (service->instance)?service->instance
-             :(_mdns_server->instance)?_mdns_server->instance
-             :_mdns_server->hostname;
+    str[0] = _mdns_get_service_instance_name(service);
     str[1] = service->service;
     str[2] = service->proto;
     str[3] = MDNS_DEFAULT_DOMAIN;
+
+    if (!str[0]) {
+        return 0;
+    }
 
     part_length = _mdns_append_fqdn(packet, index, str, 4);
     if (!part_length) {
@@ -817,6 +566,9 @@ static uint16_t _mdns_append_txt_record(uint8_t * packet, uint16_t * index, mdns
                 return 0;
             }
             data_len += l;
+        } else {
+            HOOK_MALLOC_FAILED;
+            // continue
         }
         txt = txt->next;
     }
@@ -846,12 +598,14 @@ static uint16_t _mdns_append_srv_record(uint8_t * packet, uint16_t * index, mdns
     uint16_t record_length = 0;
     uint8_t part_length;
 
-    str[0] = (service->instance)?service->instance
-             :(_mdns_server->instance)?_mdns_server->instance
-             :_mdns_server->hostname;
+    str[0] = _mdns_get_service_instance_name(service);
     str[1] = service->service;
     str[2] = service->proto;
     str[3] = MDNS_DEFAULT_DOMAIN;
+
+    if (!str[0]) {
+        return 0;
+    }
 
     part_length = _mdns_append_fqdn(packet, index, str, 4);
     if (!part_length) {
@@ -877,6 +631,11 @@ static uint16_t _mdns_append_srv_record(uint8_t * packet, uint16_t * index, mdns
 
     str[0] = _mdns_server->hostname;
     str[1] = MDNS_DEFAULT_DOMAIN;
+
+    if (_str_null_or_empty(str[0])) {
+        return 0;
+    }
+
     part_length = _mdns_append_fqdn(packet, index, str, 2);
     if (!part_length) {
         return 0;
@@ -905,6 +664,11 @@ static uint16_t _mdns_append_a_record(uint8_t * packet, uint16_t * index, uint32
 
     str[0] = _mdns_server->hostname;
     str[1] = MDNS_DEFAULT_DOMAIN;
+
+    if (_str_null_or_empty(str[0])) {
+        return 0;
+    }
+
 
     part_length = _mdns_append_fqdn(packet, index, str, 2);
     if (!part_length) {
@@ -950,6 +714,11 @@ static uint16_t _mdns_append_aaaa_record(uint8_t * packet, uint16_t * index, uin
 
     str[0] = _mdns_server->hostname;
     str[1] = MDNS_DEFAULT_DOMAIN;
+
+    if (_str_null_or_empty(str[0])) {
+        return 0;
+    }
+
 
     part_length = _mdns_append_fqdn(packet, index, str, 2);
     if (!part_length) {
@@ -1067,9 +836,7 @@ static uint8_t _mdns_append_answer(uint8_t * packet, uint16_t * index, mdns_out_
 
         if (answer->service) {
             return _mdns_append_ptr_record(packet, index,
-                (answer->service->instance)?answer->service->instance
-                    :(_mdns_server->instance)?_mdns_server->instance
-                    :_mdns_server->hostname,
+                _mdns_get_service_instance_name(answer->service),
                 answer->service->service, answer->service->proto,
                 answer->flush, answer->bye) > 0;
         } else {
@@ -1194,7 +961,7 @@ static void _mdns_dispatch_tx_packet(mdns_tx_packet_t * p)
     mdns_debug_packet(packet, index);
 #endif
 
-    _udp_pcb_write(p->tcpip_if, p->ip_protocol, &p->dst, p->port, packet, index);
+    _mdns_udp_pcb_write(p->tcpip_if, p->ip_protocol, &p->dst, p->port, packet, index);
 }
 
 /**
@@ -1375,6 +1142,7 @@ static bool _mdns_alloc_answer(mdns_out_answer_t ** destnation, uint16_t type, m
 
     mdns_out_answer_t * a = (mdns_out_answer_t *)malloc(sizeof(mdns_out_answer_t));
     if (!a) {
+        HOOK_MALLOC_FAILED;
         return false;
     }
     a->type = type;
@@ -1393,6 +1161,7 @@ static mdns_tx_packet_t * _mdns_alloc_packet_default(tcpip_adapter_if_t tcpip_if
 {
     mdns_tx_packet_t * packet = (mdns_tx_packet_t*)malloc(sizeof(mdns_tx_packet_t));
     if (!packet) {
+        HOOK_MALLOC_FAILED;
         return NULL;
     }
     memset((uint8_t*)packet, 0, sizeof(mdns_tx_packet_t));
@@ -1440,7 +1209,7 @@ static void _mdns_create_answer_from_parsed_packet(mdns_parsed_packet_t * parsed
         }
         if (service) {
             if (q->type == MDNS_TYPE_PTR || q->type == MDNS_TYPE_ANY) {
-                if (q->type == MDNS_TYPE_PTR) {
+                if (q->type == MDNS_TYPE_PTR || !parsed_packet->probe) {
                     shared = true;
                 }
                 if (!_mdns_alloc_answer(&packet->answers, MDNS_TYPE_PTR, service->service, false, false)
@@ -1530,33 +1299,33 @@ static mdns_tx_packet_t * _mdns_create_probe_packet(tcpip_adapter_if_t tcpip_if,
     for (i=0; i<len; i++) {
         mdns_out_question_t * q = (mdns_out_question_t *)malloc(sizeof(mdns_out_question_t));
         if (!q) {
+            HOOK_MALLOC_FAILED;
             _mdns_free_tx_packet(packet);
             return NULL;
         }
         q->next = NULL;
         q->unicast = first;
         q->type = MDNS_TYPE_ANY;
-        q->host = (services[i]->service->instance)?services[i]->service->instance
-                  :(_mdns_server->instance)?_mdns_server->instance
-                  :_mdns_server->hostname;
+        q->host = _mdns_get_service_instance_name(services[i]->service);
         q->service = services[i]->service->service;
         q->proto = services[i]->service->proto;
         q->domain = MDNS_DEFAULT_DOMAIN;
-        if (_mdns_question_exists(q, packet->questions)) {
+        if (!q->host || _mdns_question_exists(q, packet->questions)) {
             free(q);
         } else {
             queueToEnd(mdns_out_question_t, packet->questions, q);
         }
 
-        if (!_mdns_alloc_answer(&packet->servers, MDNS_TYPE_SRV, services[i]->service, false, false)) {
+        if (!q->host || !_mdns_alloc_answer(&packet->servers, MDNS_TYPE_SRV, services[i]->service, false, false)) {
             _mdns_free_tx_packet(packet);
             return NULL;
         }
     }
 
-    if (include_ip) {
+    if (include_ip && !_str_null_or_empty(_mdns_server->hostname)) {
         mdns_out_question_t * q = (mdns_out_question_t *)malloc(sizeof(mdns_out_question_t));
         if (!q) {
+            HOOK_MALLOC_FAILED;
             _mdns_free_tx_packet(packet);
             return NULL;
         }
@@ -1666,6 +1435,7 @@ static void _mdns_pcb_send_bye(tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t i
     if (!packet) {
         return;
     }
+    packet->flags = MDNS_FLAGS_AUTHORITATIVE;
     size_t i;
     for (i=0; i<len; i++) {
         if (!_mdns_alloc_answer(&packet->answers, MDNS_TYPE_PTR, services[i]->service, true, true)) {
@@ -1691,7 +1461,7 @@ static void _mdns_init_pcb_probe(tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t
 
     _mdns_clear_pcb_tx_queue_head(tcpip_if, ip_protocol);
 
-    if (!_mdns_server->hostname || !_mdns_server->hostname[0]) {
+    if (_str_null_or_empty(_mdns_server->hostname)) {
         pcb->state = PCB_RUNNING;
         return;
     }
@@ -1703,6 +1473,7 @@ static void _mdns_init_pcb_probe(tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t
     if (services_final_len) {
         _services = (mdns_srv_item_t **)malloc(sizeof(mdns_srv_item_t *) * services_final_len);
         if (!_services) {
+            HOOK_MALLOC_FAILED;
             return;
         }
 
@@ -1766,7 +1537,7 @@ static void _mdns_restart_pcb(tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t ip
 static void _mdns_send_bye(mdns_srv_item_t ** services, size_t len, bool include_ip)
 {
     uint8_t i, j;
-    if (!_mdns_server->hostname || !_mdns_server->hostname[0]) {
+    if (_str_null_or_empty(_mdns_server->hostname)) {
         return;
     }
 
@@ -1810,7 +1581,7 @@ static void _mdns_announce_pcb(tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t i
             }
         } else if (_pcb->state == PCB_RUNNING) {
 
-            if (!_mdns_server->hostname || !_mdns_server->hostname[0]) {
+            if (_str_null_or_empty(_mdns_server->hostname)) {
                 return;
             }
 
@@ -1983,6 +1754,7 @@ static mdns_txt_linked_item_t * _mdns_allocate_txt(size_t num_items, mdns_txt_it
         for (i=0; i<num_items; i++) {
             mdns_txt_linked_item_t * new_item = (mdns_txt_linked_item_t *)malloc(sizeof(mdns_txt_linked_item_t));
             if (!new_item) {
+                HOOK_MALLOC_FAILED;
                 break;
             }
             new_item->key = strdup(txt[i].key);
@@ -2002,6 +1774,17 @@ static mdns_txt_linked_item_t * _mdns_allocate_txt(size_t num_items, mdns_txt_it
     }
     return new_txt;
 }
+static void _mdns_free_linked_txt(mdns_txt_linked_item_t *txt)
+{
+    mdns_txt_linked_item_t *t;
+    while (txt) {
+        t = txt;
+        txt = txt->next;
+        free((char *)t->value);
+        free((char *)t->key);
+        free(t);
+    }
+}
 
 /**
  * @brief  creates/allocates new service
@@ -2018,6 +1801,7 @@ static mdns_service_t * _mdns_create_service(const char * service, const char * 
 {
     mdns_service_t * s = (mdns_service_t *)malloc(sizeof(mdns_service_t));
     if (!s) {
+        HOOK_MALLOC_FAILED;
         return NULL;
     }
 
@@ -2050,6 +1834,114 @@ static mdns_service_t * _mdns_create_service(const char * service, const char * 
 }
 
 /**
+ * @brief  Remove and free service answer from answer list (destination)
+ */
+static void _mdns_dealloc_scheduled_service_answers(mdns_out_answer_t ** destination, mdns_service_t * service)
+{
+    mdns_out_answer_t * d = *destination;
+    if (!d) {
+        return;
+    }
+    while (d && d->service == service) {
+        *destination = d->next;
+        free(d);
+        d = *destination;
+    }
+    while (d && d->next) {
+        mdns_out_answer_t * a = d->next;
+        if (a->service == service) {
+            d->next = a->next;
+            free(a);
+        } else {
+            d = d->next;
+        }
+    }
+}
+
+/**
+ * @brief  Find, remove and free answers and scheduled packets for service
+ */
+static void _mdns_remove_scheduled_service_packets(mdns_service_t * service)
+{
+    mdns_tx_packet_t * p = NULL;
+    mdns_tx_packet_t * q = _mdns_server->tx_queue_head;
+    while (q) {
+        bool had_answers = (q->answers != NULL);
+
+        _mdns_dealloc_scheduled_service_answers(&(q->answers), service);
+        _mdns_dealloc_scheduled_service_answers(&(q->additional), service);
+        _mdns_dealloc_scheduled_service_answers(&(q->servers), service);
+
+
+        mdns_pcb_t * _pcb = &_mdns_server->interfaces[q->tcpip_if].pcbs[q->ip_protocol];
+        if(_pcb->pcb) {
+            if (PCB_STATE_IS_PROBING(_pcb)) {
+                uint8_t i;
+                //check if we are probing this service
+                for (i=0; i<_pcb->probe_services_len; i++) {
+                    mdns_srv_item_t * s = _pcb->probe_services[i];
+                    if (s->service == service){
+                        break;
+                    }
+                }
+                if (i < _pcb->probe_services_len) {
+                    if (_pcb->probe_services_len > 1) {
+                        uint8_t n;
+                        for (n=(i+1); n<_pcb->probe_services_len; n++) {
+                            _pcb->probe_services[n-1] = _pcb->probe_services[n];
+                        }
+                        _pcb->probe_services_len--;
+                    } else {
+                        _pcb->probe_services_len = 0;
+                        free(_pcb->probe_services);
+                        _pcb->probe_services = NULL;
+                        if (!_pcb->probe_ip) {
+                            _pcb->probe_running = false;
+                            _pcb->state = PCB_RUNNING;
+                        }
+                    }
+
+                    if (q->questions) {
+                        mdns_out_question_t * qsn = NULL;
+                        mdns_out_question_t * qs = q->questions;
+                        if (qs->type == MDNS_TYPE_ANY
+                            && qs->service && strcmp(qs->service, service->service) == 0
+                            && qs->proto && strcmp(qs->proto, service->proto) == 0)
+                        {
+                            q->questions = q->questions->next;
+                            free(qs);
+                        } else while (qs->next) {
+                            qsn = qs->next;
+                            if (qsn->type == MDNS_TYPE_ANY
+                                && qsn->service && strcmp(qsn->service, service->service) == 0
+                                && qsn->proto && strcmp(qsn->proto, service->proto) == 0)
+                            {
+                                qs->next = qsn->next;
+                                free(qsn);
+                                break;
+                            }
+                            qs = qs->next;
+                        }
+                    }
+                }
+            } else if (PCB_STATE_IS_ANNOUNCING(_pcb)) {
+                //if answers were cleared, set to running
+                if (had_answers && q->answers == NULL) {
+                    _pcb->state = PCB_RUNNING;
+                }
+            }
+        }
+
+        p = q;
+        q = q->next;
+        if(!p->questions && !p->answers && !p->additional && !p->servers){
+            queueDetach(mdns_tx_packet_t, _mdns_server->tx_queue_head, p);
+            _mdns_free_tx_packet(p);
+        }
+    }
+}
+
+/**
  * @brief  free service memory
  *
  * @param  service      the service
@@ -2059,6 +1951,7 @@ static void _mdns_free_service(mdns_service_t * service)
     if (!service) {
         return;
     }
+    _mdns_remove_scheduled_service_packets(service);
     free((char *)service->instance);
     free((char *)service->service);
     free((char *)service->proto);
@@ -2083,6 +1976,10 @@ static void _mdns_free_service(mdns_service_t * service)
  */
 static int _mdns_check_srv_collision(mdns_service_t * service, uint16_t priority, uint16_t weight, uint16_t port, const char * host, const char * domain)
 {
+    if (_str_null_or_empty(_mdns_server->hostname)) {
+        return 0;
+    }
+
     size_t our_host_len = strlen(_mdns_server->hostname);
     size_t our_len = 14 + our_host_len;
 
@@ -2168,6 +2065,9 @@ static int _mdns_check_txt_collision(mdns_service_t * service, const uint8_t * d
             sprintf(tmp, "%s=%s", txt->key, txt->value);
             _mdns_append_string(ours, &index, tmp);
             free(tmp);
+        } else {
+            HOOK_MALLOC_FAILED;
+            // continue
         }
         txt = txt->next;
     }
@@ -2290,20 +2190,23 @@ static bool _mdns_name_is_discovery(mdns_name_t * name, uint16_t type)
 static bool _mdns_name_is_ours(mdns_name_t * name)
 {
     //domain have to be "local"
-    if (!name->domain || !name->domain[0] || strcasecmp(name->domain, MDNS_DEFAULT_DOMAIN)) {
+    if (_str_null_or_empty(name->domain) || strcasecmp(name->domain, MDNS_DEFAULT_DOMAIN)) {
         return false;
     }
 
     //if service and proto are empty, host must match out hostname
-    if ((!name->service || !name->service[0]) && (!name->proto || !name->proto[0])) {
-        if (name->host && name->host[0] && strcasecmp(name->host, _mdns_server->hostname) == 0) {
+    if (_str_null_or_empty(name->service) && _str_null_or_empty(name->proto)) {
+        if (!_str_null_or_empty(name->host)
+          && !_str_null_or_empty(_mdns_server->hostname)
+          && strcasecmp(name->host, _mdns_server->hostname) == 0)
+        {
             return true;
         }
         return false;
     }
 
     //if service or proto is empty, name is invalid
-    if ((!name->service || !name->service[0]) || (!name->proto || !name->proto[0])) {
+    if (_str_null_or_empty(name->service) || _str_null_or_empty(name->proto)) {
         return false;
     }
 
@@ -2314,20 +2217,14 @@ static bool _mdns_name_is_ours(mdns_name_t * name)
     }
 
     //if host is empty and we have service, we have success
-    if (!name->host || !name->host[0]) {
+    if (_str_null_or_empty(name->host)) {
         return true;
     }
 
     //OK we have host in the name. find what is the instance of the service
-    const char * instance = service->service->instance;
+    const char * instance = _mdns_get_service_instance_name(service->service);
     if (instance == NULL) {
-        if (_mdns_server->instance && _mdns_server->instance[0]) {
-            instance = _mdns_server->instance;
-        } else if (_mdns_server->hostname && _mdns_server->hostname[0]) {
-            instance = _mdns_server->hostname;
-        } else {
-            return false;
-        }
+        return false;
     }
 
     //compare the instance against the name
@@ -2420,14 +2317,8 @@ static bool _mdns_question_matches(mdns_parsed_question_t * question, uint16_t t
             return true;
         }
     } else if (type == MDNS_TYPE_SRV || type == MDNS_TYPE_TXT) {
-        const char * name = service->service->instance;
-        if (!name) {
-            name = _mdns_server->instance;
-        }
-        if (!name) {
-            name = _mdns_server->hostname;
-        }
-        if (!strcasecmp(name, question->host)
+        const char * name = _mdns_get_service_instance_name(service->service);
+        if (name && question->host && !strcasecmp(name, question->host)
             && !strcasecmp(service->service->service, question->service)
             && !strcasecmp(service->service->proto, question->proto)
             && !strcasecmp(MDNS_DEFAULT_DOMAIN, question->domain)) {
@@ -2533,6 +2424,10 @@ static void _mdns_result_txt_create(const uint8_t * data, size_t len, mdns_txt_i
     }
 
     mdns_txt_item_t * txt = (mdns_txt_item_t *)malloc(sizeof(mdns_txt_item_t) * num_items);
+    if (!txt) {
+        HOOK_MALLOC_FAILED;
+        return;
+    }
     memset(txt, 0, sizeof(mdns_txt_item_t) * num_items);
     size_t txt_num = 0;
 
@@ -2553,6 +2448,7 @@ static void _mdns_result_txt_create(const uint8_t * data, size_t len, mdns_txt_i
         }
         char * key = (char *)malloc(name_len + 1);
         if (!key) {
+            HOOK_MALLOC_FAILED;
             goto handle_error;//error
         }
 
@@ -2566,6 +2462,10 @@ static void _mdns_result_txt_create(const uint8_t * data, size_t len, mdns_txt_i
         int value_len = partLen - name_len - 1;
         if (value_len > 0) {
             char * value = (char *)malloc(value_len + 1);
+            if (!value) {
+                HOOK_MALLOC_FAILED;
+                goto handle_error;//error
+            }
             memcpy(value, data + i, value_len);
             value[value_len] = 0;
             i += value_len;
@@ -2629,6 +2529,7 @@ void mdns_parse_packet(mdns_rx_packet_t * packet)
 
     mdns_parsed_packet_t * parsed_packet = (mdns_parsed_packet_t *)malloc(sizeof(mdns_parsed_packet_t));
     if (!parsed_packet) {
+        HOOK_MALLOC_FAILED;
         return;
     }
     memset(parsed_packet, 0, sizeof(mdns_parsed_packet_t));
@@ -2644,6 +2545,12 @@ void mdns_parse_packet(mdns_rx_packet_t * packet)
     header.additional = _mdns_read_u16(data, MDNS_HEAD_ADDITIONAL_OFFSET);
 
     if (header.flags.value == MDNS_FLAGS_AUTHORITATIVE && packet->src_port != MDNS_SERVICE_PORT) {
+        free(parsed_packet);
+        return;
+    }
+
+    //if we have not set the hostname, we can not answer questions
+    if (header.questions && _str_null_or_empty(_mdns_server->hostname)) {
         free(parsed_packet);
         return;
     }
@@ -2683,8 +2590,9 @@ void mdns_parse_packet(mdns_rx_packet_t * packet)
                 parsed_packet->discovery = true;
                 mdns_srv_item_t * a = _mdns_server->services;
                 while (a) {
-                    mdns_parsed_question_t * question = (mdns_parsed_question_t *)malloc(sizeof(mdns_parsed_question_t));
+                    mdns_parsed_question_t * question = (mdns_parsed_question_t *)calloc(1, sizeof(mdns_parsed_question_t));
                     if (!question) {
+                        HOOK_MALLOC_FAILED;
                         goto clear_rx_packet;
                     }
                     question->next = parsed_packet->questions;
@@ -2706,12 +2614,13 @@ void mdns_parse_packet(mdns_rx_packet_t * packet)
                 continue;
             }
 
-            if (type == MDNS_TYPE_ANY) {
+            if (type == MDNS_TYPE_ANY && !_str_null_or_empty(name->host)) {
                 parsed_packet->probe = true;
             }
 
-            mdns_parsed_question_t * question = (mdns_parsed_question_t *)malloc(sizeof(mdns_parsed_question_t));
+            mdns_parsed_question_t * question = (mdns_parsed_question_t *)calloc(1, sizeof(mdns_parsed_question_t));
             if (!question) {
+                HOOK_MALLOC_FAILED;
                 goto clear_rx_packet;
             }
             question->next = parsed_packet->questions;
@@ -2859,14 +2768,14 @@ void mdns_parse_packet(mdns_rx_packet_t * packet)
                             do_not_reply = true;
                             if (_mdns_server->interfaces[packet->tcpip_if].pcbs[packet->ip_protocol].probe_running) {
                                 _mdns_server->interfaces[packet->tcpip_if].pcbs[packet->ip_protocol].failed_probes++;
-                                if (service->service->instance) {
+                                if (!_str_null_or_empty(service->service->instance)) {
                                     char * new_instance = _mdns_mangle_name((char *)service->service->instance);
                                     if (new_instance) {
                                         free((char *)service->service->instance);
                                         service->service->instance = new_instance;
                                     }
                                     _mdns_probe_all_pcbs(&service, 1, false, false);
-                                } else if (_mdns_server->instance) {
+                                } else if (!_str_null_or_empty(_mdns_server->instance)) {
                                     char * new_instance = _mdns_mangle_name((char *)_mdns_server->instance);
                                     if (new_instance) {
                                         free((char *)_mdns_server->instance);
@@ -2894,10 +2803,6 @@ void mdns_parse_packet(mdns_rx_packet_t * packet)
                 if (search_result) {
                     mdns_txt_item_t * txt = NULL;
                     size_t txt_count = 0;
-                    _mdns_result_txt_create(data_ptr, data_len, &txt, &txt_count);
-                    if (!txt_count) {
-                        continue;
-                    }
 
                     mdns_result_t * result = NULL;
                     if (search_result->type == MDNS_TYPE_PTR) {
@@ -2917,8 +2822,11 @@ void mdns_parse_packet(mdns_rx_packet_t * packet)
                             }
                         }
                         if (!result->txt) {
-                            result->txt = txt;
-                            result->txt_count = txt_count;
+                            _mdns_result_txt_create(data_ptr, data_len, &txt, &txt_count);
+                            if (txt_count) {
+                                result->txt = txt;
+                                result->txt_count = txt_count;
+                            }
                         }
                     } else {
                         _mdns_search_result_add_txt(search_result, txt, txt_count, packet->tcpip_if, packet->ip_protocol);
@@ -3172,6 +3080,7 @@ static mdns_search_once_t * _mdns_search_init(const char * name, const char * se
 {
     mdns_search_once_t * search = (mdns_search_once_t *)malloc(sizeof(mdns_search_once_t));
     if (!search) {
+        HOOK_MALLOC_FAILED;
         return NULL;
     }
     memset(search, 0, sizeof(mdns_search_once_t));
@@ -3182,7 +3091,7 @@ static mdns_search_once_t * _mdns_search_init(const char * name, const char * se
         return NULL;
     }
 
-    if (name) {
+    if (!_str_null_or_empty(name)) {
         search->instance = strndup(name, MDNS_NAME_BUF_LEN-1);
         if (!search->instance) {
             _mdns_search_free(search);
@@ -3190,7 +3099,7 @@ static mdns_search_once_t * _mdns_search_init(const char * name, const char * se
         }
     }
 
-    if (service) {
+    if (!_str_null_or_empty(service)) {
         search->service = strndup(service, MDNS_NAME_BUF_LEN-1);
         if (!search->service) {
             _mdns_search_free(search);
@@ -3198,7 +3107,7 @@ static mdns_search_once_t * _mdns_search_init(const char * name, const char * se
         }
     }
 
-    if (proto) {
+    if (!_str_null_or_empty(proto)) {
         search->proto = strndup(proto, MDNS_NAME_BUF_LEN-1);
         if (!search->proto) {
             _mdns_search_free(search);
@@ -3263,6 +3172,7 @@ static mdns_ip_addr_t * _mdns_result_addr_create_ip(ip_addr_t * ip)
 {
     mdns_ip_addr_t * a = (mdns_ip_addr_t *)malloc(sizeof(mdns_ip_addr_t));
     if (!a) {
+        HOOK_MALLOC_FAILED;
         return NULL;
     }
     memset(a, 0 , sizeof(mdns_ip_addr_t));
@@ -3322,6 +3232,7 @@ static void _mdns_search_result_add_ip(mdns_search_once_t * search, const char *
         if (!search->max_results || search->num_results < search->max_results) {
             r = (mdns_result_t *)malloc(sizeof(mdns_result_t));
             if (!r) {
+                HOOK_MALLOC_FAILED;
                 return;
             }
 
@@ -3343,7 +3254,7 @@ static void _mdns_search_result_add_ip(mdns_search_once_t * search, const char *
     } else if (search->type == MDNS_TYPE_PTR) {
         r = search->result;
         while (r) {
-            if (r->tcpip_if == tcpip_if && r->ip_protocol == ip_protocol && r->hostname && !strcasecmp(hostname, r->hostname)) {
+            if (r->tcpip_if == tcpip_if && r->ip_protocol == ip_protocol && !_str_null_or_empty(r->hostname) && !strcasecmp(hostname, r->hostname)) {
                 _mdns_result_add_ip(r, ip);
                 break;
             }
@@ -3359,7 +3270,7 @@ static mdns_result_t * _mdns_search_result_add_ptr(mdns_search_once_t * search, 
 {
     mdns_result_t * r = search->result;
     while (r) {
-        if (r->tcpip_if == tcpip_if && r->ip_protocol == ip_protocol && r->instance_name && !strcasecmp(instance, r->instance_name)) {
+        if (r->tcpip_if == tcpip_if && r->ip_protocol == ip_protocol && !_str_null_or_empty(r->instance_name) && !strcasecmp(instance, r->instance_name)) {
             return r;
         }
         r = r->next;
@@ -3367,6 +3278,7 @@ static mdns_result_t * _mdns_search_result_add_ptr(mdns_search_once_t * search, 
     if (!search->max_results || search->num_results < search->max_results) {
         r = (mdns_result_t *)malloc(sizeof(mdns_result_t));
         if (!r) {
+            HOOK_MALLOC_FAILED;
             return NULL;
         }
 
@@ -3394,7 +3306,7 @@ static void _mdns_search_result_add_srv(mdns_search_once_t * search, const char 
 {
     mdns_result_t * r = search->result;
     while (r) {
-        if (r->tcpip_if == tcpip_if && r->ip_protocol == ip_protocol && r->hostname && !strcasecmp(hostname, r->hostname)) {
+        if (r->tcpip_if == tcpip_if && r->ip_protocol == ip_protocol && !_str_null_or_empty(r->hostname) && !strcasecmp(hostname, r->hostname)) {
             return;
         }
         r = r->next;
@@ -3402,6 +3314,7 @@ static void _mdns_search_result_add_srv(mdns_search_once_t * search, const char 
     if (!search->max_results || search->num_results < search->max_results) {
         r = (mdns_result_t *)malloc(sizeof(mdns_result_t));
         if (!r) {
+            HOOK_MALLOC_FAILED;
             return;
         }
 
@@ -3430,7 +3343,7 @@ static void _mdns_search_result_add_txt(mdns_search_once_t * search, mdns_txt_it
     while (r) {
         if (r->tcpip_if == tcpip_if && r->ip_protocol == ip_protocol) {
             if (r->txt) {
-                return;
+                goto free_txt;
             }
             r->txt = txt;
             r->txt_count = txt_count;
@@ -3441,12 +3354,8 @@ static void _mdns_search_result_add_txt(mdns_search_once_t * search, mdns_txt_it
     if (!search->max_results || search->num_results < search->max_results) {
         r = (mdns_result_t *)malloc(sizeof(mdns_result_t));
         if (!r) {
-            for (i=0; i<txt_count; i++) {
-                free((char *)(txt[i].key));
-                free((char *)(txt[i].value));
-            }
-            free(txt);
-            return;
+            HOOK_MALLOC_FAILED;
+            goto free_txt;
         }
 
         memset(r, 0 , sizeof(mdns_result_t));
@@ -3458,6 +3367,14 @@ static void _mdns_search_result_add_txt(mdns_search_once_t * search, mdns_txt_it
         search->result = r;
         search->num_results++;
     }
+    return;
+
+free_txt:
+    for (i=0; i<txt_count; i++) {
+        free((char *)(txt[i].key));
+        free((char *)(txt[i].value));
+    }
+    free(txt);
 }
 
 /**
@@ -3488,7 +3405,7 @@ static mdns_search_once_t * _mdns_search_find_from(mdns_search_once_t * s, mdns_
             }
             r = s->result;
             while (r) {
-                if (r->tcpip_if == tcpip_if && r->ip_protocol == ip_protocol && r->hostname && !strcasecmp(name->host, r->hostname)) {
+                if (r->tcpip_if == tcpip_if && r->ip_protocol == ip_protocol && !_str_null_or_empty(r->hostname) && !strcasecmp(name->host, r->hostname)) {
                     return s;
                 }
                 r = r->next;
@@ -3543,6 +3460,7 @@ static mdns_tx_packet_t * _mdns_create_search_packet(mdns_search_once_t * search
 
     mdns_out_question_t * q = (mdns_out_question_t *)malloc(sizeof(mdns_out_question_t));
     if (!q) {
+        HOOK_MALLOC_FAILED;
         _mdns_free_tx_packet(packet);
         return NULL;
     }
@@ -3565,6 +3483,7 @@ static mdns_tx_packet_t * _mdns_create_search_packet(mdns_search_once_t * search
             }
             mdns_out_answer_t * a = (mdns_out_answer_t *)malloc(sizeof(mdns_out_answer_t));
             if (!a) {
+                HOOK_MALLOC_FAILED;
                 _mdns_free_tx_packet(packet);
                 return NULL;
             }
@@ -3590,7 +3509,7 @@ static mdns_tx_packet_t * _mdns_create_search_packet(mdns_search_once_t * search
 static void _mdns_search_send_pcb(mdns_search_once_t * search, tcpip_adapter_if_t tcpip_if, mdns_ip_protocol_t ip_protocol)
 {
     mdns_tx_packet_t * packet = NULL;
-    if (_mdns_server->interfaces[tcpip_if].pcbs[ip_protocol].pcb && _mdns_server->interfaces[tcpip_if].pcbs[ip_protocol].state == PCB_RUNNING) {
+    if (_mdns_server->interfaces[tcpip_if].pcbs[ip_protocol].pcb && _mdns_server->interfaces[tcpip_if].pcbs[ip_protocol].state > PCB_INIT) {
         packet = _mdns_create_search_packet(search, tcpip_if, ip_protocol);
         if (!packet) {
             return;
@@ -3605,6 +3524,22 @@ static void _mdns_search_send_pcb(mdns_search_once_t * search, tcpip_adapter_if_
  */
 static void _mdns_search_send(mdns_search_once_t * search)
 {
+    mdns_search_once_t* queue = _mdns_server->search_once;
+    bool found = false;
+    // looking for this search in active searches
+    while (queue) {
+        if (queue == search) {
+            found = true;
+            break;
+        }
+        queue = queue->next;
+    }
+
+    if (!found) {
+        // no longer active -> skip sending this search
+        return;
+    }
+
     uint8_t i, j;
     for (i=0; i<TCPIP_ADAPTER_IF_MAX; i++) {
         for (j=0; j<MDNS_IP_PROTOCOL_MAX; j++) {
@@ -3690,7 +3625,7 @@ static void _mdns_free_action(mdns_action_t * action)
         free(action->data.srv_instance.instance);
         break;
     case ACTION_SERVICE_TXT_REPLACE:
-        free(action->data.srv_txt_replace.txt);
+        _mdns_free_linked_txt(action->data.srv_txt_replace.txt);
         break;
     case ACTION_SERVICE_TXT_SET:
         free(action->data.srv_txt_set.key);
@@ -3755,7 +3690,7 @@ static void _mdns_execute_action(mdns_action_t * action)
 
         break;
     case ACTION_SERVICE_INSTANCE_SET:
-        if (action->data.srv_port.service->service->instance) {
+        if (action->data.srv_instance.service->service->instance) {
             _mdns_send_bye(&action->data.srv_instance.service, 1, false);
             free((char*)action->data.srv_instance.service->service->instance);
         }
@@ -3772,14 +3707,8 @@ static void _mdns_execute_action(mdns_action_t * action)
         service = action->data.srv_txt_replace.service->service;
         txt = service->txt;
         service->txt = NULL;
-        while (txt) {
-            t = txt;
-            txt = txt->next;
-            free((char *)t->value);
-            free((char *)t->key);
-            free(t);
-        }
-        service->txt = _mdns_allocate_txt(action->data.srv_txt_replace.num_items, action->data.srv_txt_replace.txt);
+        _mdns_free_linked_txt(txt);
+        service->txt = action->data.srv_txt_replace.txt;
         _mdns_announce_all_pcbs(&action->data.srv_txt_replace.service, 1, false);
 
         break;
@@ -3800,6 +3729,7 @@ static void _mdns_execute_action(mdns_action_t * action)
         if (!txt) {
             txt = (mdns_txt_linked_item_t *)malloc(sizeof(mdns_txt_linked_item_t));
             if (!txt) {
+                HOOK_MALLOC_FAILED;
                 _mdns_free_action(action);
                 return;
             }
@@ -3855,7 +3785,7 @@ static void _mdns_execute_action(mdns_action_t * action)
                 a = a->next;
             }
             if (a->next == action->data.srv_del.service) {
-                mdns_srv_item_t * b = a;
+                mdns_srv_item_t * b = a->next;
                 a->next = a->next->next;
                 _mdns_send_bye(&b, 1, false);
                 _mdns_free_service(b->service);
@@ -3908,6 +3838,7 @@ static esp_err_t _mdns_send_search_action(mdns_action_type_t type, mdns_search_o
 
     action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
+        HOOK_MALLOC_FAILED;
         return ESP_ERR_NO_MEM;
     }
 
@@ -3925,13 +3856,14 @@ static esp_err_t _mdns_send_search_action(mdns_action_type_t type, mdns_search_o
  */
 static void _mdns_scheduler_run()
 {
+    MDNS_SERVICE_LOCK();
     mdns_tx_packet_t * p = _mdns_server->tx_queue_head;
     mdns_action_t * action = NULL;
 
     if (!p) {
+        MDNS_SERVICE_UNLOCK();
         return;
     }
-    MDNS_SERVICE_LOCK();
     if ((int32_t)(p->send_at - (xTaskGetTickCount() * portTICK_PERIOD_MS)) < 0) {
         action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
         if (action) {
@@ -3942,6 +3874,9 @@ static void _mdns_scheduler_run()
                 free(action);
                 _mdns_server->tx_queue_head = p;
             }
+        } else {
+            HOOK_MALLOC_FAILED;
+            // continue
         }
     }
     MDNS_SERVICE_UNLOCK();
@@ -3952,12 +3887,13 @@ static void _mdns_scheduler_run()
  */
 static void _mdns_search_run()
 {
+    MDNS_SERVICE_LOCK();
     mdns_search_once_t * s = _mdns_server->search_once;
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (!s) {
+        MDNS_SERVICE_UNLOCK();
         return;
     }
-    MDNS_SERVICE_LOCK();
     while (s) {
         if (s->state != SEARCH_OFF) {
             if (now > (s->started_at + s->timeout)) {
@@ -4043,7 +3979,6 @@ static esp_err_t _mdns_stop_timer(){
  */
 static esp_err_t _mdns_service_task_start()
 {
-#ifndef MDNS_TEST_MODE
     if (!_mdns_service_semaphore) {
         _mdns_service_semaphore = xSemaphoreCreateMutex();
         if (!_mdns_service_semaphore) {
@@ -4063,8 +3998,6 @@ static esp_err_t _mdns_service_task_start()
         }
     }
     MDNS_SERVICE_UNLOCK();
-#endif
-
     return ESP_OK;
 }
 
@@ -4076,9 +4009,9 @@ static esp_err_t _mdns_service_task_start()
  */
 static esp_err_t _mdns_service_task_stop()
 {
-#ifndef MDNS_TEST_MODE
     MDNS_SERVICE_LOCK();
     _mdns_stop_timer();
+    MDNS_SERVICE_UNLOCK();
     if (_mdns_service_task_handle) {
         mdns_action_t action;
         mdns_action_t * a = &action;
@@ -4091,8 +4024,6 @@ static esp_err_t _mdns_service_task_stop()
             vTaskDelay(10 / portTICK_PERIOD_MS);
         }
     }
-    MDNS_SERVICE_UNLOCK();
-#endif
     return ESP_OK;
 }
 
@@ -4108,6 +4039,7 @@ esp_err_t mdns_handle_system_event(void *ctx, system_event_t *event)
 
     mdns_action_t * action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
+        HOOK_MALLOC_FAILED;
         return ESP_OK;
     }
     action->type = ACTION_SYSTEM_EVENT;
@@ -4129,6 +4061,7 @@ esp_err_t mdns_init()
 
     _mdns_server = (mdns_server_t *)malloc(sizeof(mdns_server_t));
     if (!_mdns_server) {
+        HOOK_MALLOC_FAILED;
         return ESP_ERR_NO_MEM;
     }
     memset((uint8_t*)_mdns_server, 0, sizeof(mdns_server_t));
@@ -4182,8 +4115,8 @@ void mdns_free()
     if (!_mdns_server) {
         return;
     }
-    _mdns_service_task_stop();
     mdns_service_remove_all(_mdns_server);
+    _mdns_service_task_stop();
     for (i=0; i<TCPIP_ADAPTER_IF_MAX; i++) {
         for (j=0; j<MDNS_IP_PROTOCOL_MAX; j++) {
             _mdns_pcb_deinit(i, j);
@@ -4221,7 +4154,7 @@ esp_err_t mdns_hostname_set(const char * hostname)
     if (!_mdns_server) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (strlen(hostname) > (MDNS_NAME_BUF_LEN - 1)) {
+    if (_str_null_or_empty(hostname) || strlen(hostname) > (MDNS_NAME_BUF_LEN - 1)) {
         return ESP_ERR_INVALID_ARG;
     }
     char * new_hostname = strndup(hostname, MDNS_NAME_BUF_LEN - 1);
@@ -4231,6 +4164,7 @@ esp_err_t mdns_hostname_set(const char * hostname)
 
     mdns_action_t * action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
+        HOOK_MALLOC_FAILED;
         free(new_hostname);
         return ESP_ERR_NO_MEM;
     }
@@ -4249,7 +4183,7 @@ esp_err_t mdns_instance_name_set(const char * instance)
     if (!_mdns_server) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (strlen(instance) > (MDNS_NAME_BUF_LEN - 1)) {
+    if (_str_null_or_empty(instance) || strlen(instance) > (MDNS_NAME_BUF_LEN - 1)) {
         return ESP_ERR_INVALID_ARG;
     }
     char * new_instance = strndup(instance, MDNS_NAME_BUF_LEN - 1);
@@ -4259,6 +4193,7 @@ esp_err_t mdns_instance_name_set(const char * instance)
 
     mdns_action_t * action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
+        HOOK_MALLOC_FAILED;
         free(new_instance);
         return ESP_ERR_NO_MEM;
     }
@@ -4278,9 +4213,14 @@ esp_err_t mdns_instance_name_set(const char * instance)
 
 esp_err_t mdns_service_add(const char * instance, const char * service, const char * proto, uint16_t port, mdns_txt_item_t txt[], size_t num_items)
 {
-    if (!_mdns_server || !service || !proto || !port) {
+    if (!_mdns_server || _str_null_or_empty(service) || _str_null_or_empty(proto) || !port) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    if (!_mdns_can_add_more_services()) {
+        return ESP_ERR_NO_MEM;
+    }
+
     mdns_srv_item_t * item = _mdns_get_service_item(service, proto);
     if (item) {
         return ESP_ERR_INVALID_ARG;
@@ -4293,6 +4233,7 @@ esp_err_t mdns_service_add(const char * instance, const char * service, const ch
 
     item = (mdns_srv_item_t *)malloc(sizeof(mdns_srv_item_t));
     if (!item) {
+        HOOK_MALLOC_FAILED;
         _mdns_free_service(s);
         return ESP_ERR_NO_MEM;
     }
@@ -4302,6 +4243,7 @@ esp_err_t mdns_service_add(const char * instance, const char * service, const ch
 
     mdns_action_t * action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
+        HOOK_MALLOC_FAILED;
         _mdns_free_service(s);
         free(item);
         return ESP_ERR_NO_MEM;
@@ -4328,7 +4270,7 @@ esp_err_t mdns_service_add(const char * instance, const char * service, const ch
 
 esp_err_t mdns_service_port_set(const char * service, const char * proto, uint16_t port)
 {
-    if (!_mdns_server || !_mdns_server->services || !service || !proto || !port) {
+    if (!_mdns_server || !_mdns_server->services || _str_null_or_empty(service) || _str_null_or_empty(proto) || !port) {
         return ESP_ERR_INVALID_ARG;
     }
     mdns_srv_item_t * s = _mdns_get_service_item(service, proto);
@@ -4338,6 +4280,7 @@ esp_err_t mdns_service_port_set(const char * service, const char * proto, uint16
 
     mdns_action_t * action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
+        HOOK_MALLOC_FAILED;
         return ESP_ERR_NO_MEM;
     }
     action->type = ACTION_SERVICE_PORT_SET;
@@ -4352,7 +4295,7 @@ esp_err_t mdns_service_port_set(const char * service, const char * proto, uint16
 
 esp_err_t mdns_service_txt_set(const char * service, const char * proto, mdns_txt_item_t txt[], uint8_t num_items)
 {
-    if (!_mdns_server || !_mdns_server->services || !service || !proto || (num_items && txt == NULL)) {
+    if (!_mdns_server || !_mdns_server->services || _str_null_or_empty(service) || _str_null_or_empty(proto) || (num_items && txt == NULL)) {
         return ESP_ERR_INVALID_ARG;
     }
     mdns_srv_item_t * s = _mdns_get_service_item(service, proto);
@@ -4360,27 +4303,26 @@ esp_err_t mdns_service_txt_set(const char * service, const char * proto, mdns_tx
         return ESP_ERR_NOT_FOUND;
     }
 
-    mdns_txt_item_t * txt_copy = NULL;
+    mdns_txt_linked_item_t * new_txt = NULL;
     if (num_items){
-        txt_copy = (mdns_txt_item_t *)malloc(num_items * sizeof(mdns_txt_item_t));
-        if (!txt_copy) {
+        new_txt = _mdns_allocate_txt(num_items, txt);
+        if (!new_txt) {
             return ESP_ERR_NO_MEM;
         }
-        memcpy(txt_copy, txt, num_items * sizeof(mdns_txt_item_t));
     }
 
     mdns_action_t * action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
-        free(txt_copy);
+        HOOK_MALLOC_FAILED;
+        _mdns_free_linked_txt(new_txt);
         return ESP_ERR_NO_MEM;
     }
     action->type = ACTION_SERVICE_TXT_REPLACE;
     action->data.srv_txt_replace.service = s;
-    action->data.srv_txt_replace.num_items = num_items;
-    action->data.srv_txt_replace.txt = txt_copy;
+    action->data.srv_txt_replace.txt = new_txt;
 
     if (xQueueSend(_mdns_server->action_queue, &action, (portTickType)0) != pdPASS) {
-        free(txt_copy);
+        _mdns_free_linked_txt(new_txt);
         free(action);
         return ESP_ERR_NO_MEM;
     }
@@ -4390,7 +4332,7 @@ esp_err_t mdns_service_txt_set(const char * service, const char * proto, mdns_tx
 
 esp_err_t mdns_service_txt_item_set(const char * service, const char * proto, const char * key, const char * value)
 {
-    if (!_mdns_server || !_mdns_server->services || !service || !proto) {
+    if (!_mdns_server || !_mdns_server->services || _str_null_or_empty(service) || _str_null_or_empty(proto) || _str_null_or_empty(key) || !value) {
         return ESP_ERR_INVALID_ARG;
     }
     mdns_srv_item_t * s = _mdns_get_service_item(service, proto);
@@ -4399,6 +4341,7 @@ esp_err_t mdns_service_txt_item_set(const char * service, const char * proto, co
     }
     mdns_action_t * action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
+        HOOK_MALLOC_FAILED;
         return ESP_ERR_NO_MEM;
     }
 
@@ -4426,7 +4369,7 @@ esp_err_t mdns_service_txt_item_set(const char * service, const char * proto, co
 
 esp_err_t mdns_service_txt_item_remove(const char * service, const char * proto, const char * key)
 {
-    if (!_mdns_server || !_mdns_server->services || !service || !proto) {
+    if (!_mdns_server || !_mdns_server->services || _str_null_or_empty(service) || _str_null_or_empty(proto) || _str_null_or_empty(key)) {
         return ESP_ERR_INVALID_ARG;
     }
     mdns_srv_item_t * s = _mdns_get_service_item(service, proto);
@@ -4435,6 +4378,7 @@ esp_err_t mdns_service_txt_item_remove(const char * service, const char * proto,
     }
     mdns_action_t * action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
+        HOOK_MALLOC_FAILED;
         return ESP_ERR_NO_MEM;
     }
 
@@ -4455,10 +4399,10 @@ esp_err_t mdns_service_txt_item_remove(const char * service, const char * proto,
 
 esp_err_t mdns_service_instance_name_set(const char * service, const char * proto, const char * instance)
 {
-    if (!_mdns_server || !_mdns_server->services || !service || !proto) {
+    if (!_mdns_server || !_mdns_server->services || _str_null_or_empty(service) || _str_null_or_empty(proto)) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (strlen(instance) > (MDNS_NAME_BUF_LEN - 1)) {
+    if (_str_null_or_empty(instance) || strlen(instance) > (MDNS_NAME_BUF_LEN - 1)) {
         return ESP_ERR_INVALID_ARG;
     }
     mdns_srv_item_t * s = _mdns_get_service_item(service, proto);
@@ -4472,6 +4416,7 @@ esp_err_t mdns_service_instance_name_set(const char * service, const char * prot
 
     mdns_action_t * action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
+        HOOK_MALLOC_FAILED;
         free(new_instance);
         return ESP_ERR_NO_MEM;
     }
@@ -4488,7 +4433,7 @@ esp_err_t mdns_service_instance_name_set(const char * service, const char * prot
 
 esp_err_t mdns_service_remove(const char * service, const char * proto)
 {
-    if (!_mdns_server || !_mdns_server->services || !service || !proto) {
+    if (!_mdns_server || !_mdns_server->services || _str_null_or_empty(service) || _str_null_or_empty(proto)) {
         return ESP_ERR_INVALID_ARG;
     }
     mdns_srv_item_t * s = _mdns_get_service_item(service, proto);
@@ -4498,6 +4443,7 @@ esp_err_t mdns_service_remove(const char * service, const char * proto)
 
     mdns_action_t * action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
+        HOOK_MALLOC_FAILED;
         return ESP_ERR_NO_MEM;
     }
     action->type = ACTION_SERVICE_DEL;
@@ -4520,6 +4466,7 @@ esp_err_t mdns_service_remove_all()
 
     mdns_action_t * action = (mdns_action_t *)malloc(sizeof(mdns_action_t));
     if (!action) {
+        HOOK_MALLOC_FAILED;
         return ESP_ERR_NO_MEM;
     }
     action->type = ACTION_SERVICES_CLEAR;
@@ -4573,7 +4520,7 @@ esp_err_t mdns_query(const char * name, const char * service, const char * proto
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (!timeout) {
+    if (!timeout || _str_null_or_empty(service) != _str_null_or_empty(proto)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -4596,7 +4543,7 @@ esp_err_t mdns_query(const char * name, const char * service, const char * proto
 
 esp_err_t mdns_query_ptr(const char * service, const char * proto, uint32_t timeout, size_t max_results, mdns_result_t ** results)
 {
-    if (!service || !proto) {
+    if (_str_null_or_empty(service) || _str_null_or_empty(proto)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -4605,7 +4552,7 @@ esp_err_t mdns_query_ptr(const char * service, const char * proto, uint32_t time
 
 esp_err_t mdns_query_srv(const char * instance, const char * service, const char * proto, uint32_t timeout, mdns_result_t ** result)
 {
-    if (!instance || !service || !proto) {
+    if (_str_null_or_empty(instance) || _str_null_or_empty(service) || _str_null_or_empty(proto)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -4614,7 +4561,7 @@ esp_err_t mdns_query_srv(const char * instance, const char * service, const char
 
 esp_err_t mdns_query_txt(const char * instance, const char * service, const char * proto, uint32_t timeout, mdns_result_t ** result)
 {
-    if (!instance || !service || !proto) {
+    if (_str_null_or_empty(instance) || _str_null_or_empty(service) || _str_null_or_empty(proto)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -4626,7 +4573,7 @@ esp_err_t mdns_query_a(const char * name, uint32_t timeout, ip4_addr_t * addr)
     mdns_result_t * result = NULL;
     esp_err_t err;
 
-    if (!name) {
+    if (_str_null_or_empty(name)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -4659,7 +4606,7 @@ esp_err_t mdns_query_aaaa(const char * name, uint32_t timeout, ip6_addr_t * addr
     mdns_result_t * result = NULL;
     esp_err_t err;
 
-    if (!name) {
+    if (_str_null_or_empty(name)) {
         return ESP_ERR_INVALID_ARG;
     }
 

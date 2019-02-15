@@ -17,34 +17,36 @@
  **  Name:          btc_a2dp_source.c
  **
  ******************************************************************************/
-#include "bt_target.h"
-#include "bt_trace.h"
+#include "common/bt_target.h"
+#include "common/bt_trace.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
-#include "allocator.h"
-#include "alarm.h"
-#include "thread.h"
-#include "mutex.h"
-#include "fixed_queue.h"
-#include "a2d_api.h"
-#include "a2d_sbc.h"
-#include "bta_av_api.h"
-#include "bta_av_sbc.h"
-#include "bta_av_ci.h"
-#include "btc_manage.h"
-#include "btc_common.h"
+#include "osi/allocator.h"
+#include "osi/alarm.h"
+#include "osi/thread.h"
+#include "osi/mutex.h"
+#include "osi/fixed_queue.h"
+#include "stack/a2d_api.h"
+#include "stack/a2d_sbc.h"
+#include "bta/bta_av_api.h"
+#include "bta/bta_av_sbc.h"
+#include "bta/bta_av_ci.h"
+#include "btc/btc_manage.h"
+#include "btc/btc_common.h"
 #include "btc_av_co.h"
 #include "btc_a2dp.h"
 #include "btc_a2dp_control.h"
 #include "btc_a2dp_source.h"
 #include "btc_av.h"
-#include "btc_util.h"
+#include "btc/btc_util.h"
 #include "esp_a2dp_api.h"
 #include "sbc_encoder.h"
+#include "osi/future.h"
+#include <assert.h>
 
 #if BTC_AV_SRC_INCLUDED
 
@@ -154,7 +156,6 @@ typedef struct {
     tBTC_AV_FEEDING_MODE feeding_mode;
     tBTC_AV_MEDIA_FEEDINGS_STATE media_feeding_state;
     tBTC_AV_MEDIA_FEEDINGS media_feeding;
-    SBC_ENC_PARAMS encoder;
     osi_alarm_t *media_alarm;
 } tBTC_A2DP_SOURCE_CB;
 
@@ -176,6 +177,7 @@ static void btc_a2dp_source_encoder_init(void);
 
 static tBTC_A2DP_SOURCE_CB btc_aa_src_cb;
 static int btc_a2dp_source_state = BTC_A2DP_SOURCE_STATE_OFF;
+static future_t *btc_a2dp_source_future = NULL;
 static xTaskHandle  btc_aa_src_task_hdl = NULL;
 static QueueHandle_t btc_aa_src_data_queue = NULL;
 static QueueHandle_t btc_aa_src_ctrl_queue = NULL;
@@ -183,6 +185,13 @@ static QueueSetHandle_t btc_aa_src_queue_set;
 
 static esp_a2d_source_data_cb_t btc_aa_src_data_cb = NULL;
 static UINT64 last_frame_us = 0;
+
+#if BTC_SBC_ENC_DYNAMIC_MEMORY == FALSE
+static SBC_ENC_PARAMS btc_sbc_encoder;
+#else
+static SBC_ENC_PARAMS *btc_sbc_encoder_ptr;
+#define btc_sbc_encoder (*btc_sbc_encoder_ptr)
+#endif /* BTC_SBC_ENC_DYNAMIC_MEMORY == FALSE */
 
 void btc_a2dp_src_reg_data_cb(esp_a2d_source_data_cb_t callback)
 {
@@ -307,6 +316,14 @@ bool btc_a2dp_source_startup(void)
 
     APPL_TRACE_EVENT("## A2DP SOURCE START MEDIA THREAD ##");
 
+#if BTC_SBC_ENC_DYNAMIC_MEMORY == TRUE
+    btc_sbc_encoder_ptr = osi_calloc(sizeof(SBC_ENC_PARAMS));
+    if (!btc_sbc_encoder_ptr) {
+        APPL_TRACE_ERROR("failed to allocate SBC encoder");
+        goto error_exit;
+    }
+#endif /* #if BTC_SBC_ENC_DYNAMIC_MEMORY == TRUE */
+
     btc_aa_src_queue_set = xQueueCreateSet(BTC_A2DP_SOURCE_TASK_QUEUE_SET_LEN);
     configASSERT(btc_aa_src_queue_set);
     btc_aa_src_data_queue = xQueueCreate(BTC_A2DP_SOURCE_DATA_QUEUE_LEN, sizeof(void *));
@@ -352,6 +369,12 @@ error_exit:;
         vQueueDelete(btc_aa_src_queue_set);
         btc_aa_src_queue_set = NULL;
     }
+#if (BTC_SBC_ENC_DYNAMIC_MEMORY == TRUE)
+    if (btc_sbc_encoder_ptr) {
+        osi_free(btc_sbc_encoder_ptr);
+        btc_sbc_encoder_ptr = NULL;
+    }
+#endif /* #if BTC_SBC_ENC_DYNAMIC_MEMORY == TRUE */
     return false;
 }
 
@@ -360,7 +383,12 @@ void btc_a2dp_source_shutdown(void)
     APPL_TRACE_EVENT("## A2DP SOURCE STOP MEDIA THREAD ##\n");
 
     // Exit thread
+    btc_a2dp_source_state = BTC_A2DP_SOURCE_STATE_SHUTTING_DOWN;
+    btc_a2dp_source_future = future_new();
+    assert(btc_a2dp_source_future);
     btc_a2dp_source_ctrl_post(BTC_MEDIA_TASK_CLEAN_UP, NULL);
+    future_await(btc_a2dp_source_future);
+    btc_a2dp_source_future = NULL;
 
     vTaskDelete(btc_aa_src_task_hdl);
     btc_aa_src_task_hdl = NULL;
@@ -373,6 +401,11 @@ void btc_a2dp_source_shutdown(void)
 
     vQueueDelete(btc_aa_src_queue_set);
     btc_aa_src_queue_set = NULL;
+
+#if (BTC_SBC_ENC_DYNAMIC_MEMORY == TRUE)
+    osi_free(btc_sbc_encoder_ptr);
+    btc_sbc_encoder_ptr = NULL;
+#endif /* #if BTC_SBC_ENC_DYNAMIC_MEMORY == TRUE */
 }
 
 /*****************************************************************************
@@ -528,6 +561,9 @@ void btc_a2dp_source_setup_codec(void)
  *******************************************************************************/
 BT_HDR *btc_a2dp_source_audio_readbuf(void)
 {
+    if (btc_a2dp_source_state != BTC_A2DP_SOURCE_STATE_ON){
+        return NULL;
+    }
     return fixed_queue_try_dequeue(btc_aa_src_cb.TxAaQ);
 }
 
@@ -783,13 +819,14 @@ static void btc_a2dp_source_enc_init(BT_HDR *p_msg)
     btc_aa_src_cb.timestamp = 0;
 
     /* SBC encoder config (enforced even if not used) */
-    btc_aa_src_cb.encoder.s16ChannelMode = pInitAudio->ChannelMode;
-    btc_aa_src_cb.encoder.s16NumOfSubBands = pInitAudio->NumOfSubBands;
-    btc_aa_src_cb.encoder.s16NumOfBlocks = pInitAudio->NumOfBlocks;
-    btc_aa_src_cb.encoder.s16AllocationMethod = pInitAudio->AllocationMethod;
-    btc_aa_src_cb.encoder.s16SamplingFreq = pInitAudio->SamplingFreq;
 
-    btc_aa_src_cb.encoder.u16BitRate = btc_a2dp_source_get_sbc_rate();
+    btc_sbc_encoder.s16ChannelMode = pInitAudio->ChannelMode;
+    btc_sbc_encoder.s16NumOfSubBands = pInitAudio->NumOfSubBands;
+    btc_sbc_encoder.s16NumOfBlocks = pInitAudio->NumOfBlocks;
+    btc_sbc_encoder.s16AllocationMethod = pInitAudio->AllocationMethod;
+    btc_sbc_encoder.s16SamplingFreq = pInitAudio->SamplingFreq;
+
+    btc_sbc_encoder.u16BitRate = btc_a2dp_source_get_sbc_rate();
 
     /* Default transcoding is PCM to SBC, modified by feeding configuration */
     btc_aa_src_cb.TxTranscoding = BTC_MEDIA_TRSCD_PCM_2_SBC;
@@ -800,14 +837,14 @@ static void btc_a2dp_source_enc_init(BT_HDR *p_msg)
     APPL_TRACE_EVENT("btc_a2dp_source_enc_init mtu %d, peer mtu %d",
                      btc_aa_src_cb.TxAaMtuSize, pInitAudio->MtuSize);
     APPL_TRACE_EVENT("      ch mode %d, subnd %d, nb blk %d, alloc %d, rate %d, freq %d",
-                     btc_aa_src_cb.encoder.s16ChannelMode, btc_aa_src_cb.encoder.s16NumOfSubBands,
-                     btc_aa_src_cb.encoder.s16NumOfBlocks,
-                     btc_aa_src_cb.encoder.s16AllocationMethod, btc_aa_src_cb.encoder.u16BitRate,
-                     btc_aa_src_cb.encoder.s16SamplingFreq);
+                     btc_sbc_encoder.s16ChannelMode, btc_sbc_encoder.s16NumOfSubBands,
+                     btc_sbc_encoder.s16NumOfBlocks,
+                     btc_sbc_encoder.s16AllocationMethod, btc_sbc_encoder.u16BitRate,
+                     btc_sbc_encoder.s16SamplingFreq);
 
     /* Reset entirely the SBC encoder */
-    SBC_Encoder_Init(&(btc_aa_src_cb.encoder));
-    APPL_TRACE_DEBUG("btc_a2dp_source_enc_init bit pool %d", btc_aa_src_cb.encoder.s16BitPool);
+    SBC_Encoder_Init(&(btc_sbc_encoder));
+    APPL_TRACE_DEBUG("btc_a2dp_source_enc_init bit pool %d", btc_sbc_encoder.s16BitPool);
 }
 
 
@@ -824,7 +861,7 @@ static void btc_a2dp_source_enc_init(BT_HDR *p_msg)
 static void btc_a2dp_source_enc_update(BT_HDR *p_msg)
 {
     tBTC_MEDIA_UPDATE_AUDIO *pUpdateAudio = (tBTC_MEDIA_UPDATE_AUDIO *) p_msg;
-    SBC_ENC_PARAMS *pstrEncParams = &btc_aa_src_cb.encoder;
+    SBC_ENC_PARAMS *pstrEncParams = &btc_sbc_encoder;
     UINT16 s16SamplingFreq;
     SINT16 s16BitPool = 0;
     SINT16 s16BitRate;
@@ -917,19 +954,19 @@ static void btc_a2dp_source_enc_update(BT_HDR *p_msg)
             if (s16BitPool > pUpdateAudio->MaxBitPool) {
                 APPL_TRACE_DEBUG("%s computed bitpool too large (%d)",  __FUNCTION__, s16BitPool);
                 /* Decrease bitrate */
-                btc_aa_src_cb.encoder.u16BitRate -= BTC_MEDIA_BITRATE_STEP;
+                btc_sbc_encoder.u16BitRate -= BTC_MEDIA_BITRATE_STEP;
                 /* Record that we have decreased the bitrate */
                 protect |= 1;
             } else if (s16BitPool < pUpdateAudio->MinBitPool) {
                 APPL_TRACE_WARNING("%s computed bitpool too small (%d)", __FUNCTION__, s16BitPool);
 
                 /* Increase bitrate */
-                UINT16 previous_u16BitRate = btc_aa_src_cb.encoder.u16BitRate;
-                btc_aa_src_cb.encoder.u16BitRate += BTC_MEDIA_BITRATE_STEP;
+                UINT16 previous_u16BitRate = btc_sbc_encoder.u16BitRate;
+                btc_sbc_encoder.u16BitRate += BTC_MEDIA_BITRATE_STEP;
                 /* Record that we have increased the bitrate */
                 protect |= 2;
                 /* Check over-flow */
-                if (btc_aa_src_cb.encoder.u16BitRate < previous_u16BitRate) {
+                if (btc_sbc_encoder.u16BitRate < previous_u16BitRate) {
                     protect |= 3;
                 }
             } else {
@@ -946,10 +983,10 @@ static void btc_a2dp_source_enc_update(BT_HDR *p_msg)
         pstrEncParams->s16BitPool = s16BitPool;
 
         APPL_TRACE_DEBUG("%s final bit rate %d, final bit pool %d", __FUNCTION__,
-                         btc_aa_src_cb.encoder.u16BitRate, btc_aa_src_cb.encoder.s16BitPool);
+                         btc_sbc_encoder.u16BitRate, btc_sbc_encoder.s16BitPool);
 
         /* make sure we reinitialize encoder with new settings */
-        SBC_Encoder_Init(&(btc_aa_src_cb.encoder));
+        SBC_Encoder_Init(&(btc_sbc_encoder));
     }
 }
 
@@ -980,10 +1017,10 @@ static void btc_a2dp_source_pcm2sbc_init(tBTC_MEDIA_INIT_AUDIO_FEEDING *p_feedin
     case 32000:
     case 48000:
         /* For these sampling_freq the AV connection must be 48000 */
-        if (btc_aa_src_cb.encoder.s16SamplingFreq != SBC_sf48000) {
+        if (btc_sbc_encoder.s16SamplingFreq != SBC_sf48000) {
             /* Reconfiguration needed at 48000 */
             APPL_TRACE_DEBUG("SBC Reconfiguration needed at 48000");
-            btc_aa_src_cb.encoder.s16SamplingFreq = SBC_sf48000;
+            btc_sbc_encoder.s16SamplingFreq = SBC_sf48000;
             reconfig_needed = TRUE;
         }
         break;
@@ -992,10 +1029,10 @@ static void btc_a2dp_source_pcm2sbc_init(tBTC_MEDIA_INIT_AUDIO_FEEDING *p_feedin
     case 22050:
     case 44100:
         /* For these sampling_freq the AV connection must be 44100 */
-        if (btc_aa_src_cb.encoder.s16SamplingFreq != SBC_sf44100) {
+        if (btc_sbc_encoder.s16SamplingFreq != SBC_sf44100) {
             /* Reconfiguration needed at 44100 */
             APPL_TRACE_DEBUG("SBC Reconfiguration needed at 44100");
-            btc_aa_src_cb.encoder.s16SamplingFreq = SBC_sf44100;
+            btc_sbc_encoder.s16SamplingFreq = SBC_sf44100;
             reconfig_needed = TRUE;
         }
         break;
@@ -1005,21 +1042,21 @@ static void btc_a2dp_source_pcm2sbc_init(tBTC_MEDIA_INIT_AUDIO_FEEDING *p_feedin
     }
 
     /* Some AV Headsets do not support Mono => always ask for Stereo */
-    if (btc_aa_src_cb.encoder.s16ChannelMode == SBC_MONO) {
+    if (btc_sbc_encoder.s16ChannelMode == SBC_MONO) {
         APPL_TRACE_DEBUG("SBC Reconfiguration needed in Stereo");
-        btc_aa_src_cb.encoder.s16ChannelMode = SBC_JOINT_STEREO;
+        btc_sbc_encoder.s16ChannelMode = SBC_JOINT_STEREO;
         reconfig_needed = TRUE;
     }
 
     if (reconfig_needed != FALSE) {
         APPL_TRACE_DEBUG("%s :: mtu %d", __FUNCTION__, btc_aa_src_cb.TxAaMtuSize);
         APPL_TRACE_DEBUG("ch mode %d, nbsubd %d, nb %d, alloc %d, rate %d, freq %d",
-                         btc_aa_src_cb.encoder.s16ChannelMode,
-                         btc_aa_src_cb.encoder.s16NumOfSubBands, btc_aa_src_cb.encoder.s16NumOfBlocks,
-                         btc_aa_src_cb.encoder.s16AllocationMethod, btc_aa_src_cb.encoder.u16BitRate,
-                         btc_aa_src_cb.encoder.s16SamplingFreq);
+                         btc_sbc_encoder.s16ChannelMode,
+                         btc_sbc_encoder.s16NumOfSubBands, btc_sbc_encoder.s16NumOfBlocks,
+                         btc_sbc_encoder.s16AllocationMethod, btc_sbc_encoder.u16BitRate,
+                         btc_sbc_encoder.s16SamplingFreq);
 
-        SBC_Encoder_Init(&(btc_aa_src_cb.encoder));
+        SBC_Encoder_Init(&(btc_sbc_encoder));
     } else {
         APPL_TRACE_DEBUG("%s no SBC reconfig needed", __FUNCTION__);
     }
@@ -1094,8 +1131,8 @@ static UINT8 btc_get_num_aa_frame(void)
 
     switch (btc_aa_src_cb.TxTranscoding) {
     case BTC_MEDIA_TRSCD_PCM_2_SBC: {
-        UINT32 pcm_bytes_per_frame = btc_aa_src_cb.encoder.s16NumOfSubBands *
-                                     btc_aa_src_cb.encoder.s16NumOfBlocks *
+        UINT32 pcm_bytes_per_frame = btc_sbc_encoder.s16NumOfSubBands *
+                                     btc_sbc_encoder.s16NumOfBlocks *
                                      btc_aa_src_cb.media_feeding.cfg.pcm.num_channel *
                                      btc_aa_src_cb.media_feeding.cfg.pcm.bit_per_sample / 8;
 
@@ -1125,7 +1162,7 @@ static UINT8 btc_get_num_aa_frame(void)
         }
         btc_aa_src_cb.media_feeding_state.pcm.counter -= result * pcm_bytes_per_frame;
 
-        LOG_VERBOSE("WRITE %d FRAMES", result);
+        BTC_TRACE_VERBOSE("WRITE %d FRAMES", result);
     }
     break;
 
@@ -1151,12 +1188,12 @@ static UINT8 btc_get_num_aa_frame(void)
 
 BOOLEAN btc_media_aa_read_feeding(void)
 {
-    UINT16 blocm_x_subband = btc_aa_src_cb.encoder.s16NumOfSubBands * \
-                             btc_aa_src_cb.encoder.s16NumOfBlocks;
+    UINT16 blocm_x_subband = btc_sbc_encoder.s16NumOfSubBands * \
+                             btc_sbc_encoder.s16NumOfBlocks;
     UINT32 read_size;
     UINT16 sbc_sampling = 48000;
     UINT32 src_samples;
-    UINT16 bytes_needed = blocm_x_subband * btc_aa_src_cb.encoder.s16NumOfChannels * \
+    UINT16 bytes_needed = blocm_x_subband * btc_sbc_encoder.s16NumOfChannels * \
                           btc_aa_src_cb.media_feeding.cfg.pcm.bit_per_sample / 8;
     static UINT16 up_sampled_buffer[SBC_MAX_NUM_FRAME * SBC_MAX_NUM_OF_BLOCKS
                                     * SBC_MAX_NUM_OF_CHANNELS * SBC_MAX_NUM_OF_SUBBANDS * 2];
@@ -1170,7 +1207,7 @@ BOOLEAN btc_media_aa_read_feeding(void)
     UINT32  nb_byte_read = 0;
 
     /* Get the SBC sampling rate */
-    switch (btc_aa_src_cb.encoder.s16SamplingFreq) {
+    switch (btc_sbc_encoder.s16SamplingFreq) {
     case SBC_sf48000:
         sbc_sampling = 48000;
         break;
@@ -1188,7 +1225,7 @@ BOOLEAN btc_media_aa_read_feeding(void)
     if (sbc_sampling == btc_aa_src_cb.media_feeding.cfg.pcm.sampling_freq) {
         read_size = bytes_needed - btc_aa_src_cb.media_feeding_state.pcm.aa_feed_residue;
         nb_byte_read = btc_aa_src_data_read(
-                           ((uint8_t *)btc_aa_src_cb.encoder.as16PcmBuffer) +
+                           ((uint8_t *)btc_sbc_encoder.as16PcmBuffer) +
                            btc_aa_src_cb.media_feeding_state.pcm.aa_feed_residue,
                            read_size);
         if (nb_byte_read == read_size) {
@@ -1282,7 +1319,7 @@ BOOLEAN btc_media_aa_read_feeding(void)
     /* only copy the pcm sample when we have up-sampled enough PCM */
     if (btc_aa_src_cb.media_feeding_state.pcm.aa_feed_residue >= bytes_needed) {
         /* Copy the output pcm samples in SBC encoding buffer */
-        memcpy((UINT8 *)btc_aa_src_cb.encoder.as16PcmBuffer,
+        memcpy((UINT8 *)btc_sbc_encoder.as16PcmBuffer,
                (UINT8 *)up_sampled_buffer,
                bytes_needed);
         /* update the residue */
@@ -1311,8 +1348,8 @@ BOOLEAN btc_media_aa_read_feeding(void)
 static void btc_media_aa_prep_sbc_2_send(UINT8 nb_frame)
 {
     BT_HDR *p_buf;
-    UINT16 blocm_x_subband = btc_aa_src_cb.encoder.s16NumOfSubBands *
-                             btc_aa_src_cb.encoder.s16NumOfBlocks;
+    UINT16 blocm_x_subband = btc_sbc_encoder.s16NumOfSubBands *
+                             btc_sbc_encoder.s16NumOfBlocks;
 
     while (nb_frame) {
         if (NULL == (p_buf = osi_malloc(BTC_MEDIA_AA_BUF_SIZE))) {
@@ -1328,27 +1365,27 @@ static void btc_media_aa_prep_sbc_2_send(UINT8 nb_frame)
 
         do {
             /* Write @ of allocated buffer in encoder.pu8Packet */
-            btc_aa_src_cb.encoder.pu8Packet = (UINT8 *) (p_buf + 1) + p_buf->offset + p_buf->len;
+            btc_sbc_encoder.pu8Packet = (UINT8 *) (p_buf + 1) + p_buf->offset + p_buf->len;
             /* Fill allocated buffer with 0 */
-            memset(btc_aa_src_cb.encoder.as16PcmBuffer, 0, blocm_x_subband
-                   * btc_aa_src_cb.encoder.s16NumOfChannels);
+            memset(btc_sbc_encoder.as16PcmBuffer, 0, blocm_x_subband
+                   * btc_sbc_encoder.s16NumOfChannels);
 
             /* Read PCM data and upsample them if needed */
             if (btc_media_aa_read_feeding()) {
                 /* SBC encode and descramble frame */
-                SBC_Encoder(&(btc_aa_src_cb.encoder));
-                A2D_SbcChkFrInit(btc_aa_src_cb.encoder.pu8Packet);
-                A2D_SbcDescramble(btc_aa_src_cb.encoder.pu8Packet, btc_aa_src_cb.encoder.u16PacketLength);
+                SBC_Encoder(&(btc_sbc_encoder));
+                A2D_SbcChkFrInit(btc_sbc_encoder.pu8Packet);
+                A2D_SbcDescramble(btc_sbc_encoder.pu8Packet, btc_sbc_encoder.u16PacketLength);
                 /* Update SBC frame length */
-                p_buf->len += btc_aa_src_cb.encoder.u16PacketLength;
+                p_buf->len += btc_sbc_encoder.u16PacketLength;
                 nb_frame--;
                 p_buf->layer_specific++;
             } else {
                 APPL_TRACE_WARNING("btc_media_aa_prep_sbc_2_send underflow %d, %d",
                                    nb_frame, btc_aa_src_cb.media_feeding_state.pcm.aa_feed_residue);
                 btc_aa_src_cb.media_feeding_state.pcm.counter += nb_frame *
-                        btc_aa_src_cb.encoder.s16NumOfSubBands *
-                        btc_aa_src_cb.encoder.s16NumOfBlocks *
+                        btc_sbc_encoder.s16NumOfSubBands *
+                        btc_sbc_encoder.s16NumOfBlocks *
                         btc_aa_src_cb.media_feeding.cfg.pcm.num_channel *
                         btc_aa_src_cb.media_feeding.cfg.pcm.bit_per_sample / 8;
                 /* no more pcm to read */
@@ -1361,7 +1398,7 @@ static void btc_media_aa_prep_sbc_2_send(UINT8 nb_frame)
                 }
             }
 
-        } while (((p_buf->len + btc_aa_src_cb.encoder.u16PacketLength) < btc_aa_src_cb.TxAaMtuSize)
+        } while (((p_buf->len + btc_sbc_encoder.u16PacketLength) < btc_aa_src_cb.TxAaMtuSize)
                  && (p_buf->layer_specific < 0x0F) && nb_frame);
 
         if (p_buf->len) {
@@ -1450,7 +1487,7 @@ static void btc_a2dp_source_send_aa_frame(void)
     }
 
     /* send it */
-    LOG_VERBOSE("%s: send %d frames", __FUNCTION__, nb_frame_2_send);
+    BTC_TRACE_VERBOSE("%s: send %d frames", __FUNCTION__, nb_frame_2_send);
     bta_av_ci_src_data_ready(BTA_AV_CHNL_AUDIO);
 }
 
@@ -1459,6 +1496,10 @@ static void btc_a2dp_source_handle_timer(UNUSED_ATTR void *context)
     log_tstamps_us("media task tx timer");
 
 #if (BTA_AV_INCLUDED == TRUE)
+    if (btc_a2dp_source_state != BTC_A2DP_SOURCE_STATE_ON){
+        return;
+    }
+
     if (btc_aa_src_cb.is_tx_timer == TRUE) {
         btc_a2dp_source_send_aa_frame();
     } else {
@@ -1525,7 +1566,7 @@ static void btc_a2dp_source_aa_start_tx(void)
     btc_aa_src_cb.media_alarm = osi_alarm_new("aaTx", btc_a2dp_source_alarm_cb, NULL, BTC_MEDIA_TIME_TICK_MS);
 
     if (!btc_aa_src_cb.media_alarm) {
-        LOG_ERROR("%s unable to allocate media alarm.", __func__);
+        BTC_TRACE_ERROR("%s unable to allocate media alarm.", __func__);
         return;
     }
 
@@ -1601,16 +1642,13 @@ static void btc_a2dp_source_thread_init(UNUSED_ATTR void *context)
 
     btc_a2dp_source_state = BTC_A2DP_SOURCE_STATE_ON;
 
-    btc_aa_src_cb.TxAaQ = fixed_queue_new(SIZE_MAX);
+    btc_aa_src_cb.TxAaQ = fixed_queue_new(QUEUE_SIZE_MAX);
 
     btc_a2dp_control_init();
 }
 
 static void btc_a2dp_source_thread_cleanup(UNUSED_ATTR void *context)
 {
-    /* make sure no channels are restarted while shutting down */
-    btc_a2dp_source_state = BTC_A2DP_SOURCE_STATE_SHUTTING_DOWN;
-
     btc_a2dp_control_set_datachnl_stat(FALSE);
     /* Clear media task flag */
     btc_a2dp_source_state = BTC_A2DP_SOURCE_STATE_OFF;
@@ -1618,6 +1656,8 @@ static void btc_a2dp_source_thread_cleanup(UNUSED_ATTR void *context)
     btc_a2dp_control_cleanup();
 
     fixed_queue_free(btc_aa_src_cb.TxAaQ, osi_free_func);
+
+    future_ready(btc_a2dp_source_future, NULL);
 }
 
 #endif /* BTC_AV_INCLUDED */

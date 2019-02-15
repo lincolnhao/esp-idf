@@ -6,6 +6,14 @@
    CONDITIONS OF ANY KIND, either express or implied.
 */
 
+
+/****************************************************************************
+* This is a demo for bluetooth config wifi connection to ap. You can config ESP32 to connect a softap
+* or config ESP32 as a softap to be connected by other device. APP can be downloaded from github 
+* android source code: https://github.com/EspressifApp/EspBlufi
+* iOS source code: https://github.com/EspressifApp/EspBlufiForiOS
+****************************************************************************/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,8 +48,8 @@ static esp_ble_adv_data_t example_adv_data = {
     .set_scan_rsp = false,
     .include_name = true,
     .include_txpower = true,
-    .min_interval = 0x100,
-    .max_interval = 0x100,
+    .min_interval = 0x0006, //slave connection min interval, Time = min_interval * 1.25 msec
+    .max_interval = 0x0010, //slave connection max interval, Time = max_interval * 1.25 msec
     .appearance = 0x00,
     .manufacturer_len = 0,
     .p_manufacturer_data =  NULL,
@@ -223,6 +231,10 @@ static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_para
         break;
     case ESP_BLUFI_EVENT_REQ_CONNECT_TO_AP:
         BLUFI_INFO("BLUFI requset wifi connect to AP\n");
+        /* there is no wifi callback when the device has already connected to this wifi
+        so disconnect wifi before connection.
+        */
+        esp_wifi_disconnect();
         esp_wifi_connect();
         break;
     case ESP_BLUFI_EVENT_REQ_DISCONNECT_FROM_AP:
@@ -280,14 +292,16 @@ static void example_event_callback(esp_blufi_cb_event_t event, esp_blufi_cb_para
         break;
 	case ESP_BLUFI_EVENT_RECV_SOFTAP_SSID:
         strncpy((char *)ap_config.ap.ssid, (char *)param->softap_ssid.ssid, param->softap_ssid.ssid_len);
+        ap_config.ap.ssid[param->softap_ssid.ssid_len] = '\0';
         ap_config.ap.ssid_len = param->softap_ssid.ssid_len;
         esp_wifi_set_config(WIFI_IF_AP, &ap_config);
         BLUFI_INFO("Recv SOFTAP SSID %s, ssid len %d\n", ap_config.ap.ssid, ap_config.ap.ssid_len);
         break;
 	case ESP_BLUFI_EVENT_RECV_SOFTAP_PASSWD:
         strncpy((char *)ap_config.ap.password, (char *)param->softap_passwd.passwd, param->softap_passwd.passwd_len);
+        ap_config.ap.password[param->softap_passwd.passwd_len] = '\0';
         esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-        BLUFI_INFO("Recv SOFTAP PASSWORD %s\n", ap_config.ap.password);
+        BLUFI_INFO("Recv SOFTAP PASSWORD %s len = %d\n", ap_config.ap.password, param->softap_passwd.passwd_len);
         break;
 	case ESP_BLUFI_EVENT_RECV_SOFTAP_MAX_CONN_NUM:
         if (param->softap_max_conn_num.max_conn_num > 4) {
@@ -367,7 +381,7 @@ void app_main()
 
     // Initialize NVS
     ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }

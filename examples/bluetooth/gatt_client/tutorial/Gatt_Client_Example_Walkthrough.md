@@ -41,7 +41,7 @@ void app_main()
 {
     // Initialize NVS.
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
@@ -103,7 +103,7 @@ The main function starts by initializing the non-volatile storage library. This 
 
 ```c
 esp_err_t ret = nvs_flash_init();
-if (ret == ESP_ERR_NVS_NO_FREE_PAGES) {
+if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     ESP_ERROR_CHECK(nvs_flash_erase());
     ret = nvs_flash_init();
 }
@@ -370,7 +370,7 @@ We are interested in the `ESP_GAP_SEARCH_INQ_RES_EVT` event, which is called eve
                         connect = true;
                         ESP_LOGI(GATTC_TAG, "connect to the remote device.");
                         esp_ble_gap_stop_scanning();
-                        esp_ble_gattc_open(gl_profile_tab[PROFILE_A_APP_ID].gattc_if, scan_result->scan_rst.bda, true);
+                        esp_ble_gattc_open(gl_profile_tab[PROFILE_A_APP_ID].gattc_if, scan_result->scan_rst.bda, scan_result->scan_rst.ble_addr_type, true);
                     }
                 }
             }

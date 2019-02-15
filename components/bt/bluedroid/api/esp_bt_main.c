@@ -14,11 +14,11 @@
 
 
 #include "esp_bt_main.h"
-#include "btc_task.h"
-#include "btc_main.h"
+#include "btc/btc_task.h"
+#include "btc/btc_main.h"
 #include "esp_bt.h"
-#include "future.h"
-#include "allocator.h"
+#include "osi/future.h"
+#include "osi/allocator.h"
 
 static bool bd_already_enable = false;
 static bool bd_already_init = false;
@@ -119,7 +119,7 @@ esp_err_t esp_bluedroid_init(void)
     future_t **future_p;
 
     if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED) {
-        LOG_ERROR("Conroller not initialised\n");
+        LOG_ERROR("Controller not initialised\n");
         return ESP_ERR_INVALID_STATE;
     }
 

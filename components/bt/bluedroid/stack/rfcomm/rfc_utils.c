@@ -22,20 +22,20 @@
  *
  *****************************************************************************/
 
-#include "bt_target.h"
+#include "common/bt_target.h"
 
-#include "btm_api.h"
+#include "stack/btm_api.h"
 #include "btm_int.h"
-#include "rfcdefs.h"
-#include "port_api.h"
-#include "port_ext.h"
+#include "stack/rfcdefs.h"
+#include "stack/port_api.h"
+#include "stack/port_ext.h"
 #include "port_int.h"
 #include "rfc_int.h"
-#include "btu.h"
-#include "bt_defs.h"
+#include "stack/btu.h"
+#include "common/bt_defs.h"
 
-#include "allocator.h"
-#include "mutex.h"
+#include "osi/allocator.h"
+#include "osi/mutex.h"
 
 #include <string.h>
 
@@ -175,7 +175,7 @@ tRFC_MCB *rfc_alloc_multiplexer_channel (BD_ADDR bd_addr, BOOLEAN is_initiator)
             RFCOMM_TRACE_DEBUG("rfc_alloc_multiplexer_channel:is_initiator:%d, create new p_mcb:%p, index:%d",
                                is_initiator, &rfc_cb.port.rfc_mcb[j], j);
 
-            p_mcb->cmd_q = fixed_queue_new(SIZE_MAX);
+            p_mcb->cmd_q = fixed_queue_new(QUEUE_SIZE_MAX);
 
             p_mcb->is_initiator = is_initiator;
 

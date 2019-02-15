@@ -22,14 +22,14 @@
  *
  ******************************************************************************/
 
-#include "bt_target.h"
+#include "common/bt_target.h"
 
 #if defined(GATTS_INCLUDED) && (GATTS_INCLUDED == TRUE)
 
 #include <string.h>
 
 #include "bta_gatts_int.h"
-#include "allocator.h"
+#include "osi/allocator.h"
 
 /* type for service building action functions */
 typedef void (*tBTA_GATTS_SRVC_ACT)(tBTA_GATTS_SRVC_CB *p_rcb, tBTA_GATTS_DATA *p_data);
@@ -129,6 +129,9 @@ BOOLEAN bta_gatts_hdl_event(BT_HDR *p_msg)
         } else {
             APPL_TRACE_ERROR("service not created\n");
         }
+        break;
+    case BTA_GATTS_API_SEND_SERVICE_CHANGE_EVT:
+        bta_gatts_send_service_change_indication((tBTA_GATTS_DATA *) p_msg);
         break;
     default:
         break;
